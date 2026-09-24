@@ -1,4 +1,4 @@
-# reality-sni-scanner
+# Reality SNI Scanner
 
 [فارسی](README.fa.md)
 
@@ -6,15 +6,37 @@ Finds good SNI/DEST domains for an Xray Reality config, automatically.
 You don't give it a list of domains to try — it builds that list itself,
 tests each one with a real TLS connection, and shows you the best picks.
 
+---
+
+## Before you start
+
+> [!IMPORTANT]
+> **Node.js v22.6.0 or newer is required.** It is the only installation
+> needed to run this scanner. You do **not** need `npm install`.
+
+Check your installed version:
+
+```powershell
+node --version
+```
+
+If Node.js is missing or older than v22.6.0, install the current LTS release
+from [nodejs.org](https://nodejs.org/en/download).
+
+**[Quick start](#quick-start)** · **[Discovery methods](#the-three-ways-it-finds-domains)** · **[Flags](#flags)** · **[فارسی](README.fa.md)**
+
+---
+
 ## Quick start
 
-No installing anything. Just run:
+After installing Node.js, open a terminal in this folder and run:
 
-```bash
+```powershell
 node run.js
 ```
 
 That's it. It will:
+
 1. Load a built-in list of a few hundred well-known domains (no internet needed for this step).
 2. Try a real TLS connection to each one.
 3. Print the ones that qualify, fastest first.
