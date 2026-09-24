@@ -115,6 +115,37 @@ each one, in a `source` column.
 
 ## Flags
 
+Use `node run.js --help` for the authoritative command reference. Common
+options are grouped here so the README stays readable on narrow screens.
+
+- `--candidates <n>` (default `400`): number of bundled domains to probe.
+- `--top <n>` (default `15`): number of qualifying domains printed to the terminal.
+- `--concurrency <n>` (default `40`): simultaneous TLS probes.
+- `--timeout <ms>` (default `4000`): maximum time per TLS connection.
+- `--out <file>` (default `results.json`): full JSON report location.
+
+Optional discovery sources:
+
+- `--neighbors`: add reverse-DNS candidates near the supplied server network.
+- `--target <ip>`: server IPv4 address used to look up its network block.
+- `--prefix <cidr>`: network block to sample directly, such as `168.222.43.0/24`.
+- `--sample <n>` (default `200`): IPs sampled from that block.
+- `--ct`: add Certificate Transparency subdomains.
+- `--ct-seeds <list>`: comma-separated domains to search in CT logs.
+- `--ct-limit <n>` (default `300`): maximum CT domains collected; each response is capped at 5 MiB.
+- `--ct-timeout <ms>` (default `15000`): time allowed for each CT lookup.
+- `--asn-timeout <ms>` (default `20000`): time allowed for an automatic network-block lookup.
+- `--remote`: try a fresh online top-domains list before falling back to the bundled list.
+
+Filtering and connection options:
+
+- `--port <n>` (default `443`): port to probe.
+- `--no-require-h2`: allow domains that do not negotiate HTTP/2.
+- `--no-require-tls13`: allow domains that do not negotiate TLS 1.3.
+- `--require-authorized`: require a publicly trusted certificate chain.
+- `--help`: print all options.
+
+<!-- Legacy table retained in source; the compact list above is used because the table is unreadable on narrow GitHub layouts.
 | Flag | Default | What it does |
 |---|---|---|
 | `--candidates <n>` | 400 | how many domains to try from the built-in list |
@@ -137,6 +168,8 @@ each one, in a `source` column.
 | `--no-require-tls13` | — | don't require TLS 1.3 |
 | `--require-authorized` | off | require a certificate trusted by a public authority (Reality doesn't actually need this) |
 | `--help` | — | show all options |
+
+-->
 
 ## Reading the results
 
