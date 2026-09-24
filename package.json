@@ -1,0 +1,17 @@
+{
+  "name": "reality-sni-scanner",
+  "version": "1.0.0",
+  "description": "Self-sourcing SNI/DEST discovery + TLS-fitness scanner for Xray Reality configs",
+  "type": "module",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "scan": "node run.js",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3",
+    "@types/node": "^22.9.0"
+  }
+}
