@@ -209,6 +209,19 @@ censors are most likely to have specifically profiled.
 The full results (including every domain that failed, and why) are saved
 to `results.json`, in case you want to look closer later.
 
+## Common issues
+
+- **No qualifying domains:** try a larger candidate pool, for example
+  `node run.js --candidates 1000`. For troubleshooting only, you can relax
+  the HTTP/2 requirement with `--no-require-h2`.
+- **Many connections time out:** check your internet connection, DNS,
+  firewall rules, and whether the default `--timeout 4000` is long enough
+  for your network.
+- **The candidate works locally but not on the VPS:** run the scanner on the
+  Xray server and choose from that result; local measurements cannot verify
+  the server-to-DEST path.
+- **Node.js is too old:** install Node.js v22.6.0 or newer, then retry.
+
 ## Requirements
 
 Node.js 22.6 or newer. Nothing else — no `npm install`, no other software.
