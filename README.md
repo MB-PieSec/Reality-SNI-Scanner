@@ -1,5 +1,7 @@
 # reality-sni-scanner
 
+[فارسی](README.fa.md)
+
 Finds good SNI/DEST domains for an Xray Reality config, automatically.
 You don't give it a list of domains to try — it builds that list itself,
 tests each one with a real TLS connection, and shows you the best picks.
