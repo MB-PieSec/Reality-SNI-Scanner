@@ -1,7 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { fetchTopDomains } from "./sources.ts";
 import { discoverNeighborDomains, isSampleableIPv4Cidr, isValidIPv4 } from "./asn.ts";
-import { discoverCTSubdomains, DEFAULT_CT_SEEDS } from "./ctlogs.ts";
+import { discoverCTSubdomains, CTDiscoveryMode, DEFAULT_CT_SEEDS } from "./ctlogs.ts";
 import { probeAll, passesFilters } from "./probe.ts";
 import { ensureXrayBinary } from "./xray.ts";
 import { rankRealityResults, runRealityTests } from "./reality-test.ts";
@@ -123,6 +123,51 @@ function dedupeCandidates(
   return out;
 }
 
+/**
+ * Ranks probe results with tie-breaking rules:
+ * 1. Lower handshake latency is better
+ * 2. Better TLS version (TLSv1.3 > TLSv1.2)
+ * 3. Authorized certificates are preferred over unauthorized
+ * 4. Original hostname source priority (top-sites > ct-log)
+ */
+function rankProbeResults(results: ProbeResult[]): ProbeResult[] {
+  return [...results].sort((a, b) => {
+    // Sort by latency (lower is better)
+    const latencyA = a.handshakeMs ?? Infinity;
+    const latencyB = b.handshakeMs ?? Infinity;
+    if (latencyA !== latencyB) return latencyA - latencyB;
+
+    // Tie-breaker 1: TLS version (TLSv1.3 > TLSv1.2)
+    const tlsA = (a.tlsVersion?.indexOf("1.3") ?? 0) >= 0 ? 1 : (a.tlsVersion?.indexOf("1.2") ?? 0) >= 0 ? 2 : 3;
+    const tlsB = (b.tlsVersion?.indexOf("1.3") ?? 0) >= 0 ? 1 : (b.tlsVersion?.indexOf("1.2") ?? 0) >= 0 ? 2 : 3;
+    if (tlsA !== tlsB) return tlsA - tlsB;
+
+    // Tie-breaker 2: Certificate authorization
+    const authA = a.authorized ? 1 : 2;
+    const authB = b.authorized ? 1 : 2;
+    if (authA !== authB) return authA - authB;
+
+    // Tie-breaker 3: Source order for reproducibility
+    const sourceOrder: Record<ProbeResult["source"], number> = {
+      "top-sites": 1,
+      "asn-neighbor": 2,
+      "ct-subdomain": 3,
+      "ct-log": 4,
+      "fallback": 5,
+    };
+    return sourceOrder[a.source] - sourceOrder[b.source];
+  });
+}
+
+/** Extract eTLD+1 base domain from a hostname (e.g., "www.google.com" -> "google.com"). */
+function extractBaseDomain(hostname: string): string {
+  const parts = hostname.split(".");
+  if (parts.length <= 2) return hostname;
+  // Simple heuristic: return last two parts (handles most common TLDs)
+  // For more accuracy, use a proper public suffix list
+  return parts.slice(-2).join(".");
+}
+
 interface Stage2Report {
   options: {
     tested: number;
@@ -165,6 +210,100 @@ function printStage2Table(results: RealityTestResult[]): void {
   if (failed.length > 0) {
     console.log("");
     for (const r of failed) console.log(`  [!] ${r.hostname}: ${r.error ?? "failed"}`);
+  }
+}
+
+/**
+ * Phase 1.5: Discover subdomains for top domains from Stage 1 and probe them.
+ * Returns the best-performing subdomains (full ProbeResult), capped at the original top limit.
+ */
+async function phase1point5(
+  topCandidates: { hostname: string; result: ProbeResult }[],
+  opts: ScanOptions,
+  topN: number,
+  onProgress?: (done: number, total: number) => void,
+): Promise<ProbeResult[]> {
+  console.error(`\n[*] phase 1.5: discovering subdomains for top ${Math.min(topN, topCandidates.length)} domains...`);
+
+  const mainDomains = topCandidates
+    .slice(0, topN)
+    .map((c) => c.hostname);
+
+  // Extract base domains (eTLD+1) from main domains for crt.sh queries
+  // e.g., "www.google.com" -> "google.com", "apple.com" -> "apple.com"
+  const baseDomains = [...new Set(mainDomains.map(extractBaseDomain))];
+
+  console.error(`[*] phase 1.5: querying crt.sh for ${baseDomains.length} base domain(s): ${baseDomains.join(", ")}`);
+
+  try {
+    const discoveredSubdomains = await discoverCTSubdomains(
+      baseDomains,
+      topN * 10, // We'll probe many more candidates than we need
+      5_000, // 5s timeout per request (crt.sh is often slow/down)
+      CTDiscoveryMode.MAIN_DOMAINS,
+    );
+
+    if (discoveredSubdomains.length === 0) {
+      console.error(`[!] phase 1.5: no subdomains discovered via crt.sh`);
+      return [];
+    }
+
+    // Probe all discovered subdomains
+    console.error(`[*] phase 1.5: probing ${discoveredSubdomains.length} discovered subdomains...`);
+    const probingResults = await probeAll(
+      discoveredSubdomains.map((hostname) => ({ hostname, source: "ct-subdomain" })),
+      opts,
+      onProgress,
+    );
+
+    // Filter passing results and rank them
+    const passing = probingResults
+      .filter((r) => passesFilters(r, opts));
+
+    if (passing.length === 0) {
+      console.error(`[!] phase 1.5: no subdomains passed filtering`);
+      return [];
+    }
+
+    console.error(`[+] phase 1.5: ${passing.length} subdomains passed filters`);
+
+    // Rank by latency, TLS version, authorization
+    const ranked = rankProbeResults(passing);
+
+    // Take top N
+    const selectedSubdomains = ranked.slice(0, topN);
+
+    const widths = {
+      idx: 3,
+      hostname: Math.max(8, ...selectedSubdomains.map((r) => r.hostname.length)) + 2,
+      tls: 10,
+      alpn: 8,
+      ms: 8,
+      authorized: 10,
+    };
+    const row = (cells: string[]) =>
+      cells
+        .map((v, i) => v.padEnd(Object.values(widths)[i]))
+        .join("");
+    console.log(`\nPhase 1.5 — best subdomains (${selectedSubdomains.length}/${passing.length}):\n`);
+    console.log(row(["#", "hostname", "tls", "alpn", "ms", "authorized"]));
+    selectedSubdomains.forEach((r, i) => {
+      console.log(
+        row([
+          String(i + 1),
+          r.hostname,
+          r.tlsVersion ?? "-",
+          String(r.alpn ?? "-"),
+          String(r.handshakeMs ?? "-"),
+          String(r.authorized ?? "-"),
+        ]),
+      );
+    });
+
+    return selectedSubdomains;
+  } catch (err) {
+    console.error(`[!] phase 1.5 skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return [];
   }
 }
 
@@ -248,10 +387,10 @@ async function main() {
 
   let lastPrinted = 0;
   const results = await probeAll(candidates, opts, (done, total) => {
-    const pct = Math.floor((done / total) * 20);
+    const pct = Math.floor((done / total) * 20); // 0-20% for Phase 1
     if (pct > lastPrinted) {
       lastPrinted = pct;
-      process.stderr.write(`\r[*] progress: ${done}/${total}`);
+      process.stderr.write(`\r[*] progress: ${done}/${total} (phase 1)`);
     }
   });
   process.stderr.write("\n");
@@ -263,8 +402,49 @@ async function main() {
   await writeFile(outFile, JSON.stringify({ options: opts, results }, null, 2));
   console.error(`[+] main: full results (including failures) written to ${outFile}`);
 
-  console.log(`\nTop ${Math.min(topN, passing.length)} of ${passing.length} qualifying domain(s):\n`);
-  const shown = passing.slice(0, topN);
+  // ---------------------------------------------------------------- Phase 1.5
+  // Discover subdomains for top-stage-1 domains and probe them
+  let subdomainResults: ProbeResult[] = [];
+  if (passing.length > 0) {
+    const stage1TopHostnames = passing
+      .slice(0, topN)
+      .map((r) => ({ hostname: r.hostname, result: r }));
+
+    subdomainResults = await phase1point5(stage1TopHostnames, opts, topN, (done, total) => {
+      const pct = Math.floor((done / total) / 2 * 20) + 20; // Append to Stage 1 progress
+      if (pct > lastPrinted) {
+        lastPrinted = Math.min(pct, 39);
+        process.stderr.write(`\r[*] progress: ${done}/${total} (phase 1.5)`);
+      }
+    });
+  }
+  process.stderr.write("\n");
+
+  // ---------------------------------------------------------------- Merge Phase 1 + Phase 1.5
+  // Combine original passing domains with discovered subdomains, re-rank, and take top N
+  let finalCandidates: ProbeResult[] = [...passing];
+  if (subdomainResults.length > 0) {
+    // Add subdomain results to the pool
+    finalCandidates = [...finalCandidates, ...subdomainResults];
+    // Re-rank first (so fastest comes first)
+    finalCandidates = rankProbeResults(finalCandidates);
+    // Deduplicate by base domain (eTLD+1) - www.blogger.com and blogger.com are the same
+    // Since we already ranked by latency, keep the first (fastest) for each base domain
+    const seen = new Set<string>();
+    finalCandidates = finalCandidates.filter((r) => {
+      const base = extractBaseDomain(r.hostname);
+      if (seen.has(base)) return false;
+      seen.add(base);
+      return true;
+    });
+    // Take top N from combined pool
+    finalCandidates = finalCandidates.slice(0, topN);
+    console.error(`[+] merged: ${passing.length} Phase 1 + ${subdomainResults.length} Phase 1.5 = ${finalCandidates.length} final candidates (deduped by base domain)`);
+  }
+
+  // Print final combined results
+  console.log(`\nTop ${Math.min(topN, finalCandidates.length)} of ${finalCandidates.length} final candidates (Phase 1 + Phase 1.5):\n`);
+  const shown = finalCandidates.slice(0, topN);
   const widths = {
     idx: 3,
     hostname: Math.max(8, ...shown.map((r) => r.hostname.length)) + 2,
@@ -294,12 +474,12 @@ async function main() {
   });
 
   // ---------------------------------------------------------------- Stage 2
-  // Re-test the best Stage-1 candidates through a real (temporary) Xray
-  // Reality tunnel. Stage-1 results are already on disk, so a Stage-2 problem
-  // can never lose them.
+  // Re-test the best candidates through a real (temporary) Xray
+  // Reality tunnel. Uses the merged final candidates.
+  // Stage-1 results are already on disk, so a Stage-2 problem can never lose them.
   let stage2: Stage2Report | undefined;
-  if (realityTestCount > 0 && passing.length > 0) {
-    const tested = passing
+  if (realityTestCount > 0 && finalCandidates.length > 0) {
+    const tested = finalCandidates
       .slice(0, realityTestCount)
       .map((r) => ({ hostname: r.hostname, handshakeMs: r.handshakeMs }));
     console.error(`\n[*] stage 2: starting full Reality tunnel test on top ${tested.length} domains.`);
@@ -353,20 +533,21 @@ async function main() {
 
   const stage2Winner = stage2 ? rankRealityResults(stage2.results).find((r) => r.ok) : undefined;
   if (stage2Winner) {
-    console.log(`\nBest pick (Stage 2): ${stage2Winner.hostname}`);
+    const source = subdomainResults.length > 0 ? "Phase 1.5 subdomain" : "Stage 1 main domain";
+    console.log(`\nBest pick (${source}): ${stage2Winner.hostname}`);
     console.log(
       `${stage2Winner.realityUploadKbps ?? "-"} kbps measured upload through a real Reality tunnel ` +
-        `(Stage 1 handshake ${stage2Winner.handshakeMs ?? "-"} ms)`,
+        `(Stage 1/Phase 1.5 handshake ${stage2Winner.handshakeMs ?? "-"} ms)`,
     );
     console.log(`Use in your Reality config as both SNI and DEST, e.g.:`);
     console.log(`  "dest": "${stage2Winner.hostname}:443",`);
     console.log(`  "serverNames": ["${stage2Winner.hostname}"]`);
   } else {
     if (stage2) {
-      console.error("[!] stage 2: no candidate completed the tunnel test — falling back to the Stage 1 pick.");
+      console.error("[!] stage 2: no candidate completed the tunnel test — falling back to the Stage 1/1.5 pick.");
     }
-    if (passing.length > 0) {
-      const best = passing[0];
+    if (finalCandidates.length > 0) {
+      const best = finalCandidates[0];
       console.log(`\nBest pick: ${best.hostname}`);
       console.log(`Use in your Reality config as both SNI and DEST, e.g.:`);
       console.log(`  "dest": "${best.hostname}:443",`);
@@ -377,7 +558,9 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("[x] Fatal error:", err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("[x] Fatal error:", err);
+    process.exit(1);
+  });

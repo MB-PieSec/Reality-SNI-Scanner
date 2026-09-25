@@ -57,29 +57,70 @@ async function readJsonWithinLimit(res: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(body));
 }
 
-async function queryCrtSh(seed: string, timeoutMs: number, limit: number): Promise<string[]> {
-  const res = await fetch(`https://crt.sh/?q=%25.${encodeURIComponent(seed)}&output=json`, {
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const entries = (await readJsonWithinLimit(res)) as CrtShEntry[];
+async function queryCrtSh(seed: string, timeoutMs: number, limit: number, maxRetries = 2): Promise<string[]> {
+  let lastError: Error | null = null;
 
-  const names = new Set<string>();
-  for (const entry of entries) {
-    if (!entry.name_value) continue;
-    // A single cert can cover multiple names (SANs), one per line.
-    for (const raw of entry.name_value.split("\n")) {
-      const name = normalizeAcceptableDomain(raw);
-      // Wildcard entries ("*.foo.com") aren't a dialable hostname on their
-      // own — skip them, we only want concrete names we can actually SNI to.
-      if (!name || raw.trim().startsWith("*.")) continue;
-      if (!name.endsWith(`.${seed}`) && name !== seed) continue; // stay on-topic
-      names.add(name);
-      if (names.size >= limit) return [...names];
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(`https://crt.sh/?q=%25.${encodeURIComponent(seed)}&output=json`, {
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+
+      if (!res.ok) {
+        // Retry on server errors (5xx) and rate limits (429)
+        if (res.status >= 500 || res.status === 429) {
+          const retryAfter = res.headers.get("retry-after");
+          const delay = retryAfter ? parseInt(retryAfter, 10) * 1000 : Math.min(500 * attempt, 2000);
+          console.error(`[!] ctlogs: ${seed}: HTTP ${res.status} (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms...`);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const entries = (await readJsonWithinLimit(res)) as CrtShEntry[];
+
+      const names = new Set<string>();
+      for (const entry of entries) {
+        if (!entry.name_value) continue;
+        for (const raw of entry.name_value.split("\n")) {
+          const name = normalizeAcceptableDomain(raw);
+          if (!name || raw.trim().startsWith("*.")) continue;
+          if (!name.endsWith(`.${seed}`) && name !== seed) continue;
+          names.add(name);
+          if (names.size >= limit) return [...names];
+        }
+      }
+      return [...names];
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      const isTimeout = lastError.name === "TimeoutError" || lastError.message.includes("timeout");
+      const isNetwork = lastError.message.includes("fetch") || lastError.message.includes("network");
+
+      if (attempt < maxRetries && (isTimeout || isNetwork)) {
+        const delay = Math.min(500 * attempt, 2000);
+        console.error(`[!] ctlogs: ${seed}: ${lastError.message} (attempt ${attempt}/${maxRetries}), retrying in ${delay}ms...`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw lastError;
     }
   }
-  return [...names];
+
+  throw lastError ?? new Error(`Failed after ${maxRetries} attempts`);
 }
+
+/**
+ * Mode for subdomain discovery.
+ * - "seeds": Query crt.sh for new domains from a list of seed domains (original behavior)
+ * - "main-domains": For each seed domain, query crt.sh to discover subdomains, then return the best-performing one
+ */
+export const CTDiscoveryMode = {
+  SEEDS: "seeds" as const,
+  MAIN_DOMAINS: "main-domains" as const,
+} as const;
+
+export type CTDiscoveryMode = (typeof CTDiscoveryMode)[keyof typeof CTDiscoveryMode];
 
 /**
  * Queries CT logs for each seed domain and returns a deduped, capped list
@@ -91,7 +132,36 @@ export async function discoverCTSubdomains(
   seeds: string[],
   totalLimit: number,
   timeoutMs = 15_000,
+  mode: CTDiscoveryMode = "seeds",
 ): Promise<string[]> {
+  if (mode === "main-domains") {
+    // Discover subdomains for each main domain and return the best one
+    const results: { hostname: string; handshakeMs: number }[] = [];
+
+    for (const seed of seeds) {
+      try {
+        const names = await queryCrtSh(seed, timeoutMs, totalLimit - results.length);
+
+        for (const name of names) {
+          results.push({ hostname: name, handshakeMs: 999999 }); // Placeholder, will be updated
+          if (results.length >= totalLimit) break;
+        }
+      } catch (err) {
+        const cause = (err as { cause?: { message?: string; code?: string } })?.cause;
+        const detail = cause?.code ?? cause?.message ?? (err as Error).message;
+        console.error(`[!] ctlogs: ${seed}: lookup failed (${detail}), skipping`);
+      }
+
+      if (results.length >= totalLimit) break;
+      // Politeness delay between requests to a free, shared service.
+      await new Promise((r) => setTimeout(r, 300));
+    }
+
+    console.error(`[+] ctlogs: discovered ${results.length} main domain subdomain(s) via crt.sh`);
+    return results.map(r => r.hostname);
+  }
+
+  // Original behavior: return all subdomains from seeds
   const found = new Set<string>();
 
   for (const seed of seeds) {
@@ -109,7 +179,7 @@ export async function discoverCTSubdomains(
       const detail = cause?.code ?? cause?.message ?? (err as Error).message;
       console.error(`[!] ctlogs: ${seed}: lookup failed (${detail}), skipping`);
     }
-    // Small politeness delay between requests to a free, shared service.
+    // Politeness delay between requests to a free, shared service.
     await new Promise((r) => setTimeout(r, 300));
   }
 
