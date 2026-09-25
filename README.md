@@ -40,6 +40,11 @@ That's it. It will:
 1. Load a built-in list of a few hundred well-known domains (no internet needed for this step).
 2. Try a real TLS connection to each one.
 3. Print the ones that qualify, fastest first.
+4. Re-test the best of them through a real Xray Reality tunnel and print the ones that actually carry traffic, fastest first.
+
+Step 4 downloads Xray itself on the first run (see
+[Stage 1 and Stage 2](#stage-1-and-stage-2)); add `--reality-test 0` if you
+only want the quick TLS results.
 
 At the bottom it prints something like this, ready to paste into your Xray config:
 
@@ -79,6 +84,49 @@ For Reality to work, the domain you borrow needs to:
 The scanner checks all four automatically for every domain it tries. Public
 certificate trust is reported but not required by default because Reality can
 operate without it; add `--require-authorized` when that is your policy.
+
+## Stage 1 and Stage 2
+
+The scan runs in two stages, and they answer different questions.
+
+**Stage 1 — the quick TLS test.** For every candidate domain it opens a real
+TLS 1.3 connection and checks the four things listed above. It takes seconds,
+downloads nothing, and works with no arguments at all: `node run.js`. This is
+the first table it prints.
+
+**Stage 2 — a full Reality tunnel test.** Answering TLS is not automatically
+enough to be a usable Reality `dest`. Xray does one extra thing with that
+domain: when a client connects, the server forwards the client's TLS
+handshake to the dest and uses the *real* site's reply as the template for its
+own answer. So a domain can pass Stage 1 and still be useless in practice.
+
+Stage 2 finds out for real. It takes the best candidates from Stage 1 and, for
+each one, starts a temporary pair of Xray processes — a server whose `dest` is
+that domain, and a client that tunnels through it — then pushes a 512 KB upload
+down the tunnel and times it:
+
+```
+this machine --TCP--> [Xray client] ==REALITY==> [Xray server] --TCP--> this machine
+```
+
+Everything is killed again as soon as the measurement is done. A domain that
+carried the upload is proven to work as a `dest`, and the measured speed is
+what decides the final pick, so the suggestion at the end of the run comes from
+the fastest domain that actually completed a tunnel — not from the fastest
+TLS handshake. Domains that fail the tunnel are still listed, with the reason.
+
+This stage costs real time — roughly 5–15 s per candidate, since Xray probes
+the dest while it starts — which is why it only runs on the top candidates.
+`--reality-test <n>` changes how many are tested; `--reality-test 0` skips it
+and leaves you with the Stage 1 table only.
+
+**You do not need to install Xray yourself.** The first time a run uses
+Stage 2, the tool downloads the official Xray-core build for your operating
+system into a `bin` folder next to `run.js` (about 20 MB, once) and reuses it
+afterwards. If that download fails — GitHub blocked, say — the Stage 1 results
+are already saved, and the tool says what happened and carries on rather than
+losing the run. If you already have Xray on the machine, `--xray <path>` uses
+that copy instead of downloading one.
 
 ## The three ways it finds domains
 
@@ -169,6 +217,16 @@ Filtering and connection options:
 - `--require-authorized`: require a publicly trusted certificate chain.
 - `--help`: print all options.
 
+Reality tunnel test (Stage 2):
+
+- `--reality-test <n>` (default `10`): how many top Stage-1 candidates to
+  re-test through a real tunnel; `0` disables this stage.
+- `--reality-upload-kb <n>` (default `512`): size of the test upload.
+- `--reality-concurrency <n>` (default `2`, max `4`): tunnels to test at once.
+  Each one runs two Xray processes, so keep this low.
+- `--xray <path>`: use an Xray binary you already have instead of the
+  automatically downloaded one.
+
 <!-- Legacy table retained in source; the compact list above is used because the table is unreadable on narrow GitHub layouts.
 | Flag | Default | What it does |
 |---|---|---|
@@ -209,8 +267,21 @@ censors are most likely to have specifically profiled.
 The full results (including every domain that failed, and why) are saved
 to `results.json`, in case you want to look closer later.
 
+If Stage 2 ran, it prints a second table underneath: the domain, its Stage 1
+handshake time, the upload speed measured through the tunnel in kbps, and
+whether the tunnel worked at all. The `ok` rows are the ones proven usable as a
+`dest`; the failed ones list the reason Xray gave. The same data, for both
+stages, is in `results.json` under `stage2`.
+
 ## Common issues
 
+- **Stage 2 takes minutes:** that is expected — it is timing real tunnels.
+  Lower the cost with `--reality-test 3`, or skip the stage with
+  `--reality-test 0`.
+- **"stage 2 skipped: ..." with a download error:** the Xray download failed
+  (usually GitHub being blocked). The Stage 1 results are still in
+  `results.json`; retry later, or point the tool at an Xray you already have
+  with `--xray <path>`.
 - **No qualifying domains:** try a larger candidate pool, for example
   `node run.js --candidates 1000`. For troubleshooting only, you can relax
   the HTTP/2 requirement with `--no-require-h2`.
@@ -225,6 +296,8 @@ to `results.json`, in case you want to look closer later.
 ## Requirements
 
 Node.js 22.6 or newer. Nothing else — no `npm install`, no other software.
+The Xray binary Stage 2 needs is downloaded for you, on first use, into a
+`bin` folder next to `run.js`.
 
 Node added the ability to run TypeScript files directly in version 22.6,
 but on some 22.x versions it needs an extra flag, and on later ones it
