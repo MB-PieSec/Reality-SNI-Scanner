@@ -306,6 +306,7 @@ async function main() {
     console.error("[*] stage 2: this will launch multiple Xray processes and may take several minutes...");
 
     let sawProgress = false;
+    let progressLineLength = 0;
     try {
       const xrayPath = await ensureXrayBinary(xrayOverride);
       const results = await runRealityTests(
@@ -318,7 +319,13 @@ async function main() {
         },
         (done, total, result) => {
           sawProgress = true;
-          process.stderr.write(`\r[*] stage 2 progress: ${done}/${total} (${result.ok ? "ok" : "failed"})`);
+          const line = `[*] stage 2 progress: ${done}/${total} (${result.ok ? "ok" : "failed"})`;
+          // Redrawing with \r does not erase: "(failed)" is 4 chars longer than
+          // "(ok)", so without padding a success after a failure would leave a
+          // "led)" tail on screen. Wipe whatever the previous line left over.
+          const pad = " ".repeat(Math.max(0, progressLineLength - line.length));
+          progressLineLength = line.length;
+          process.stderr.write(`\r${line}${pad}`);
         },
       );
       if (sawProgress) process.stderr.write("\n");
