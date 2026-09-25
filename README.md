@@ -40,10 +40,12 @@ That's it. It will:
 1. Load a built-in list of a few hundred well-known domains (no internet needed for this step).
 2. Try a real TLS connection to each one.
 3. Print the ones that qualify, fastest first.
-4. Re-test the best of them through a real Xray Reality tunnel and print the ones that actually carry traffic, fastest first.
+4. Search Certificate Transparency logs for subdomains of the top picks and probe them too.
+5. Merge everything, deduplicate, and print the best candidates.
+6. Re-test the best of them through a real Xray Reality tunnel and print the ones that actually carry traffic, fastest first.
 
-Step 4 downloads Xray itself on the first run (see
-[Stage 1 and Stage 2](#stage-1-and-stage-2)); add `--reality-test 0` if you
+Steps 5-6 download Xray itself on the first run (see
+[The three stages](#the-three-stages)); add `--reality-test 0` if you
 only want the quick TLS results.
 
 At the bottom it prints something like this, ready to paste into your Xray config:
@@ -85,14 +87,26 @@ The scanner checks all four automatically for every domain it tries. Public
 certificate trust is reported but not required by default because Reality can
 operate without it; add `--require-authorized` when that is your policy.
 
-## Stage 1 and Stage 2
+## The three stages
 
-The scan runs in two stages, and they answer different questions.
+The scan runs in three stages, and they answer different questions.
 
 **Stage 1 — the quick TLS test.** For every candidate domain it opens a real
 TLS 1.3 connection and checks the four things listed above. It takes seconds,
 downloads nothing, and works with no arguments at all: `node run.js`. This is
 the first table it prints.
+
+**Stage 1.5 — subdomain discovery (optional).** After Stage 1, the tool takes
+the top domains and searches Certificate Transparency logs (via crt.sh) for
+their subdomains (e.g., `www.google.com` → `accounts.google.com`,
+`mail.google.com`, etc.). Each discovered subdomain gets probed with the same
+TLS handshake as Stage 1, and the results are merged with Stage 1 (deduplicated
+by base domain). This finds faster, less-common subdomains that make better
+Reality disguises.
+
+> [!NOTE]
+> crt.sh is a free, shared service with ~40% uptime. If it's down, Phase 1.5
+> will be skipped automatically and you'll still get Stage 1 + Stage 2 results.
 
 **Stage 2 — a full Reality tunnel test.** Answering TLS is not automatically
 enough to be a usable Reality `dest`. Xray does one extra thing with that
@@ -100,10 +114,10 @@ domain: when a client connects, the server forwards the client's TLS
 handshake to the dest and uses the *real* site's reply as the template for its
 own answer. So a domain can pass Stage 1 and still be useless in practice.
 
-Stage 2 finds out for real. It takes the best candidates from Stage 1 and, for
-each one, starts a temporary pair of Xray processes — a server whose `dest` is
-that domain, and a client that tunnels through it — then pushes a 512 KB upload
-down the tunnel and times it:
+Stage 2 finds out for real. It takes the best candidates from Stage 1 +
+Stage 1.5 (merged and deduplicated) and, for each one, starts a temporary pair
+of Xray processes — a server whose `dest` is that domain, and a client that
+tunnels through it — then pushes a 512 KB upload down the tunnel and times it:
 
 ```
 this machine --TCP--> [Xray client] ==REALITY==> [Xray server] --TCP--> this machine
@@ -267,10 +281,14 @@ censors are most likely to have specifically profiled.
 The full results (including every domain that failed, and why) are saved
 to `results.json`, in case you want to look closer later.
 
-If Stage 2 ran, it prints a second table underneath: the domain, its Stage 1
-handshake time, the upload speed measured through the tunnel in kbps, and
+If Phase 1.5 ran, it prints a table of discovered subdomains before the
+merged results. The `ct-subdomain` source in the final table indicates a
+domain found via Certificate Transparency logs.
+
+If Stage 2 ran, it prints a second table underneath: the domain, its handshake
+time, the upload speed measured through the tunnel in kbps, and
 whether the tunnel worked at all. The `ok` rows are the ones proven usable as a
-`dest`; the failed ones list the reason Xray gave. The same data, for both
+`dest`; the failed ones list the reason Xray gave. The same data, for all
 stages, is in `results.json` under `stage2`.
 
 ## Common issues
@@ -282,6 +300,10 @@ stages, is in `results.json` under `stage2`.
   (usually GitHub being blocked). The Stage 1 results are still in
   `results.json`; retry later, or point the tool at an Xray you already have
   with `--xray <path>`.
+- **"phase 1.5: no subdomains discovered via crt.sh":** crt.sh is a free,
+  shared service with ~40% uptime. This is normal — Phase 1.5 will be
+  skipped and you'll still get Stage 1 + Stage 2 results. Retry later if
+  you want subdomain discovery.
 - **No qualifying domains:** try a larger candidate pool, for example
   `node run.js --candidates 1000`. For troubleshooting only, you can relax
   the HTTP/2 requirement with `--no-require-h2`.
