@@ -50,7 +50,7 @@ const UPLOAD_TIMEOUT_MS = 15_000;
 const WARMUP_BYTES = 16 * 1024;
 /** Kept in memory only, and only read when a candidate fails. */
 const LOG_TAIL_BYTES = 16 * 1024;
-const LOG_SNIPPET_CHARS = 500;
+const LOG_SNIPPET_CHARS = 160;
 /** Startup failures are usually a port race, so they are worth one retry. */
 const MAX_ATTEMPTS = 2;
 
@@ -101,7 +101,17 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** The most useful log lines from a failed Xray instance, if any. */
+/** Drops Xray's `2026/09/25 23:43:00.340724 [Info] ` prefix. */
+function stripLogPrefix(line: string): string {
+  return line.replace(/^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[[^\]]+\]\s*/, "");
+}
+
+/**
+ * A short, human-sized reason from a failed Xray instance: enough to tell a
+ * rejected handshake from a startup problem without printing a wall of log
+ * that reads like a crash. The complete logs for both sides are one
+ * REALITY_DEBUG_LOG away.
+ */
 function logSnippet(instance: XrayInstance | undefined): string {
   if (!instance) return "";
   const lines = instance
@@ -110,11 +120,17 @@ function logSnippet(instance: XrayInstance | undefined): string {
     .map((line) => line.trim())
     .filter((line) => line && !/Reading config/.test(line));
   if (lines.length === 0) return "";
-  const reality = lines.filter((line) => /\bREALITY\b/.test(line));
-  // REALITY's own diagnostics are the interesting part; the last few of them
-  // show exactly which step of the handshake went wrong.
-  const chosen = reality.length > 0 ? reality.slice(-4) : lines.slice(-1);
-  return chosen.join(" ~ ").slice(0, LOG_SNIPPET_CHARS);
+
+  // REALITY states its verdict plainly. The timestamp, level, logger and
+  // address around it are noise, and a retrying client logs the same verdict
+  // several times, so collect the distinct ones.
+  const reasons = new Set<string>();
+  for (const line of lines) {
+    const match = line.match(/REALITY: processed invalid connection from .*?: (.+)$/);
+    if (match) reasons.add(match[1]);
+  }
+  const chosen = reasons.size > 0 ? [...reasons] : [stripLogPrefix(lines[lines.length - 1])];
+  return chosen.join("; ").slice(0, LOG_SNIPPET_CHARS);
 }
 
 function spawnXray(binPath: string, configPath: string): XrayInstance {
@@ -405,13 +421,15 @@ async function runAttempt(
     };
   } catch (err) {
     if (err instanceof StartupError) throw err;
-    // Both sides are useful: the server explains why it refused the handshake,
-    // the client shows what the tunnel saw.
+    // The server states why it refused the handshake; the client's line is
+    // almost always just the consequence of that, so only fall back to it when
+    // the server has nothing to say. Printing both made an ordinary,
+    // expected rejection look like a crash.
     const parts = [errorMessage(err)];
-    const serverLog = logSnippet(server);
-    const clientLog = logSnippet(client);
-    if (serverLog) parts.push(`server: ${serverLog}`);
-    if (clientLog && clientLog !== serverLog) parts.push(`client: ${clientLog}`);
+    const serverReason = logSnippet(server);
+    const clientReason = serverReason ? "" : logSnippet(client);
+    if (serverReason) parts.push(`server: ${serverReason}`);
+    else if (clientReason) parts.push(`client: ${clientReason}`);
     return { hostname, ok: false, handshakeMs, error: parts.join(" | ") };
   } finally {
     if (process.env.REALITY_DEBUG_LOG) {
