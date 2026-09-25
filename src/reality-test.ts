@@ -20,8 +20,9 @@
  *
  * When a candidate fails, the tail of both Xray logs is folded into the error
  * message, because REALITY's own diagnostics say exactly which step of the
- * handshake went wrong. Set REALITY_DEBUG_LOG=1 to additionally print the full
- * logs of every failing candidate.
+ * handshake went wrong. Set REALITY_DEBUG_LOG=1 to additionally dump the full
+ * logs of every candidate and turn on REALITY's verbose per-record handshake
+ * trace (which record the dest sent and where the handshake aborted).
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -404,9 +405,6 @@ async function runAttempt(
     };
   } catch (err) {
     if (err instanceof StartupError) throw err;
-    if (process.env.REALITY_DEBUG_LOG) {
-      console.error(`\n--- server log [${hostname}] ---\n${server?.logs()}\n--- client log [${hostname}] ---\n${client?.logs()}`);
-    }
     // Both sides are useful: the server explains why it refused the handshake,
     // the client shows what the tunnel saw.
     const parts = [errorMessage(err)];
@@ -416,6 +414,9 @@ async function runAttempt(
     if (clientLog && clientLog !== serverLog) parts.push(`client: ${clientLog}`);
     return { hostname, ok: false, handshakeMs, error: parts.join(" | ") };
   } finally {
+    if (process.env.REALITY_DEBUG_LOG) {
+      console.error(`\n--- server log [${hostname}] ---\n${server?.logs()}\n--- client log [${hostname}] ---\n${client?.logs()}`);
+    }
     stopChild(client?.child);
     stopChild(server?.child);
     await sink.close();

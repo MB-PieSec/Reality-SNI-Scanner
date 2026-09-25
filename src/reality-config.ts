@@ -65,7 +65,9 @@ export function buildServerConfig(params: ServerConfigParams): unknown {
           network: "tcp",
           security: "reality",
           realitySettings: {
-            show: true,
+            // Off by default. REALITY_DEBUG_LOG=1 turns on the verbose per-record
+            // handshake trace (which record the dest sent, where it aborted).
+            show: Boolean(process.env.REALITY_DEBUG_LOG),
             dest: `${hostname}:${destPort}`,
             xver: 0,
             serverNames: [hostname],
