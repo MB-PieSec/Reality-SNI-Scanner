@@ -8,8 +8,9 @@ import {
   CTSource,
   DEFAULT_CT_SEEDS,
   DEFAULT_CT_BUDGET_MS,
-  describeCTCoverage,
   setCTLogger,
+  setCTLogBrand,
+  sourceLabel,
 } from "./ctlogs.ts";
 import { probeAll, passesFilters } from "./probe.ts";
 import { ensureXrayBinary } from "./xray.ts";
@@ -56,10 +57,10 @@ Options:
                          (default: microsoft.com,google.com,apple.com,cloudflare.com,
                          amazon.com,akamai.com,fastly.net,wikipedia.org,github.com,mozilla.org)
   --ct-limit <n>         Max total subdomains to pull from CT logs (default 300)
-  --ct-timeout <ms>      Total wall-clock budget for one CT discovery phase, shared
-                         by every source, retry and fallback (default 10000)
+  --ct-timeout <ms>      Total wall-clock time limit for one CT discovery phase,
+                         shared by every source, retry and fallback (default 10000)
   --ct-source <name>     Which CT source discovery may use: auto (default — crt.sh,
-                         then Cert Spotter, then DNS brute-force), crtsh, certspotter, dns
+                         then Cert Spotter, then DNS guessing), crtsh, certspotter, dns
   --ct-refresh           Ignore the ct-cache.json disk cache and refetch everything
   --no-ct                Skip Phase 1.5 subdomain discovery entirely
   --remote              Fetch a live top-domains list instead of the bundled snapshot
@@ -71,14 +72,16 @@ Options:
   --timeout <ms>        Per-connection TLS probe timeout in ms (default 4000)
   --asn-timeout <ms>    Per-provider ASN lookup timeout in ms (default 20000 —
                          raise this further on very high-latency connections)
-  --top <n>             How many ranked results to print (default 15)
+  --top <n>             How many ranked results to print (default 15); also caps
+                         how many candidates Stage 2 may re-test
   --out <file>          Write full JSON results here (default results.json)
   --no-require-h2       Don't require ALPN h2 (default: required)
   --no-require-tls13    Don't require TLS 1.3 (default: required)
   --require-authorized  Require a fully valid/trusted cert chain (default: off — Reality doesn't need CA trust, just a plausible cert)
-  --reality-test <n>    Stage 2: re-test the top N Stage-1 candidates by pushing a
+  --reality-test <n>    Stage 2: re-test the top N candidates by pushing a
                          real upload through a temporary Xray Reality tunnel, then
-                         rank those N by measured upload speed (default 10, 0 = off)
+                         rank those N by measured upload speed
+                         (default: min(10, --top); 0 = off)
   --reality-upload-kb <n>  Stage 2 upload payload size in KB (default 512)
   --reality-concurrency <n>  Stage 2 tests to run in parallel, 1-4 (default 2 —
                          each one launches two Xray processes, so keep this low)
@@ -99,9 +102,11 @@ Notes:
   - Candidates come from a bundled offline snapshot by default, specifically
     so this tool works over your real, unfiltered network path without
     needing a VPN just to build the candidate list.
-  - Phase 1.5 starts its CT discovery in the background while Stage 1 probes,
-    walks crt.sh -> Cert Spotter -> DNS brute-force under one --ct-timeout
-    budget, and caches what it learns in ct-cache.json for 7 days.
+  - Phase 1.5 starts its subdomain discovery in the background while Stage 1
+    probes (its log lines print under a "--- phase 1.5 ---" header after
+    Stage 1), walks crt.sh -> Cert Spotter -> DNS guessing under one
+    --ct-timeout time limit, and caches what it learns in ct-cache.json for
+    7 days.
   - Run this WITHOUT a VPN/proxy active if your goal is to find SNI/DEST
     targets that work well for clients on your real (filtered) network —
     tunneling the scan itself defeats the purpose.
@@ -183,6 +188,33 @@ function extractBaseDomain(hostname: string): string {
   // Simple heuristic: return last two parts (handles most common TLDs)
   // For more accuracy, use a proper public suffix list
   return parts.slice(-2).join(".");
+}
+
+/**
+ * One short, human phrase for why a probe didn't pass, grouped into buckets a
+ * reader can act on ("timed out x27") instead of raw OpenSSL blobs — the full
+ * per-host error string stays in results.json.
+ */
+function friendlyProbeFailure(r: ProbeResult, opts: ScanOptions): string {
+  if (!r.ok) {
+    const lower = (r.error ?? "connection failed").toLowerCase();
+    if (lower.includes("timeout")) return "timed out";
+    if (/enotfound|enodata|querya |query4 /.test(lower)) return "hostname does not resolve";
+    if (lower.includes("econnrefused")) return "connection refused";
+    if (lower.includes("econnreset") || lower.includes("socket disconnected")) return "connection dropped";
+    if (lower.includes("getaddrinfo")) return "DNS lookup failed";
+    if (/alert|handshake|protocol version/.test(lower)) return "rejected the TLS handshake";
+    return "connection failed";
+  }
+  if (opts.requireTls13 && r.tlsVersion !== "TLSv1.3") return `no TLS 1.3 (got ${r.tlsVersion ?? "?"})`;
+  if (opts.requireH2 && r.alpn !== "h2") return "no HTTP/2";
+  if (opts.requireAuthorized && !r.authorized) return "certificate not trusted";
+  return "filtered out";
+}
+
+/** "10s" for 10000, "1500ms" for 1500 — how humans say a budget. */
+function formatMs(ms: number): string {
+  return ms >= 1000 ? `${ms / 1000}s` : `${ms}ms`;
 }
 
 /**
@@ -278,7 +310,7 @@ async function phase1point5(
   ct: CtRuntimeConfig,
   onProgress?: (done: number, total: number) => void,
 ): Promise<ProbeResult[]> {
-  console.error(`\n[*] phase 1.5: discovering subdomains for top ${Math.min(topN, topCandidates.length)} domains...`);
+  setCTLogBrand("phase 1.5");
 
   const mainDomains = topCandidates
     .slice(0, topN)
@@ -288,8 +320,14 @@ async function phase1point5(
   // e.g., "www.google.com" -> "google.com", "apple.com" -> "apple.com"
   const baseDomains = [...new Set(mainDomains.map(extractBaseDomain))];
 
-  console.error(`[*] phase 1.5: querying CT sources for ${baseDomains.length} base domain(s): ${baseDomains.join(", ")}`);
-  console.error(`[*] phase 1.5: budget ${ct.budgetMs}ms, source ${ct.source}, cache ${path.basename(ct.cacheFile)}`);
+  const sourceDesc =
+    ct.source === CTSource.AUTO
+      ? "crt.sh -> Cert Spotter -> DNS guessing"
+      : `${sourceLabel(ct.source)} only (--ct-source ${ct.source})`;
+  console.error(`[*] phase 1.5: discovering subdomains of ${baseDomains.length} domains: ${baseDomains.join(", ")}`);
+  console.error(
+    `[*] phase 1.5: rules: ${formatMs(ct.budgetMs)} time limit, sources: ${sourceDesc}, results cached in ${path.basename(ct.cacheFile)}`,
+  );
 
   try {
     const discovery = await discoverCTSubdomains(baseDomains, {
@@ -301,20 +339,23 @@ async function phase1point5(
       refresh: ct.refresh,
     });
     const discoveredSubdomains = discovery.names;
-    const coverage = describeCTCoverage(discovery.bySource);
+    // Which sources actually answered — shown in the table header so nobody
+    // mistakes DNS-wordlist coverage for a full CT enumeration.
+    const headerSources = Object.keys(discovery.bySource)
+      .map(sourceLabel)
+      .join(", ");
 
     if (discoveredSubdomains.length === 0) {
-      console.error(`[!] phase 1.5: no subdomains discovered (crt.sh, Cert Spotter and DNS brute-force all failed)`);
+      console.error(
+        `[!] phase 1.5: no subdomains found — every source failed or returned nothing (stage 1 results are unaffected)`,
+      );
       return [];
     }
 
-    // Say where the names came from: cache/fallback answers mean the CT
-    // enumeration may cover only part of each base domain.
-    console.error(`[*] phase 1.5: source coverage: ${coverage}`);
-    const usedFallback = Object.keys(discovery.bySource).some((s) => s !== "crtsh");
-
-    // Probe all discovered subdomains
-    console.error(`[*] phase 1.5: probing ${discoveredSubdomains.length} discovered subdomains...`);
+    // Probe all discovered subdomains with the same TLS check as stage 1
+    console.error(
+      `[*] phase 1.5: testing ${discoveredSubdomains.length} discovered subdomains with the same TLS check as stage 1...`,
+    );
     const probingResults = await probeAll(
       discoveredSubdomains.map((hostname) => ({ hostname, source: "ct-subdomain" })),
       opts,
@@ -326,34 +367,31 @@ async function phase1point5(
       .filter((r) => passesFilters(r, opts));
 
     // Report *why* the rest were dropped — "0 passed" with no reason is
-    // unactionable (timeout storm? TLS version? ALPN?).
+    // unactionable (timeout storm? TLS version? ALPN?). Reasons are grouped
+    // into short human phrases; raw errors stay in results.json.
     if (passing.length < probingResults.length) {
       const reasons = new Map<string, number>();
       for (const r of probingResults) {
         if (passesFilters(r, opts)) continue;
-        const reason = !r.ok
-          ? (r.error ?? "connection failed")
-          : opts.requireTls13 && r.tlsVersion !== "TLSv1.3"
-            ? `tls ${r.tlsVersion ?? "?"}`
-            : opts.requireH2 && r.alpn !== "h2"
-              ? `alpn ${String(r.alpn)}`
-              : opts.requireAuthorized && !r.authorized
-                ? "unauthorized"
-                : "filtered";
+        const reason = friendlyProbeFailure(r, opts);
         reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
       }
       const summary = [...reasons.entries()]
-        .map(([reason, count]) => `${reason.replace(/\s+/g, " ").trim()} x${count}`)
+        .map(([reason, count]) => `${reason} x${count}`)
         .join(", ");
-      console.error(`[!] phase 1.5: filters dropped ${probingResults.length - passing.length} subdomain(s): ${summary}`);
+      console.error(
+        `[!] phase 1.5: ${probingResults.length - passing.length} of ${probingResults.length} subdomains did not pass: ${summary}`,
+      );
     }
 
     if (passing.length === 0) {
-      console.error(`[!] phase 1.5: no subdomains passed filtering`);
+      console.error(
+        `[!] phase 1.5: none of the ${probingResults.length} discovered subdomains passed — stage 1 results are unaffected (reasons above)`,
+      );
       return [];
     }
 
-    console.error(`[+] phase 1.5: ${passing.length} subdomains passed filters`);
+    console.error(`[+] phase 1.5: ${passing.length} of ${probingResults.length} subdomains passed the TLS check`);
 
     // Rank by latency, TLS version, authorization
     const ranked = rankProbeResults(passing);
@@ -373,9 +411,9 @@ async function phase1point5(
       cells
         .map((v, i) => v.padEnd(Object.values(widths)[i]))
         .join("");
-    // Surface a fallback/cache-backed result in the header itself, so nobody
+    // Surface where the names came from in the header itself, so nobody
     // mistakes DNS-wordlist coverage for a full CT enumeration.
-    const headerNote = usedFallback && coverage ? ` [coverage: ${coverage}]` : "";
+    const headerNote = headerSources ? ` [sources: ${headerSources}]` : "";
     console.log(`\nPhase 1.5 — best subdomains (${selectedSubdomains.length}/${passing.length})${headerNote}:\n`);
     console.log(row(["#", "hostname", "tls", "alpn", "ms", "authorized"]));
     selectedSubdomains.forEach((r, i) => {
@@ -421,7 +459,9 @@ async function main() {
   const useRemote = flags.has("remote");
   const explicitPrefix = flags.get("prefix");
   const asnTimeoutMs = readIntegerFlag(flags, "asn-timeout", 20_000, 100, 300_000);
-  const realityTestCount = readIntegerFlag(flags, "reality-test", 10, 0, 100);
+  // Stage 2 re-tests at most 10 candidates and never more than --top, so
+  // "--top 5" means five of everything instead of five printed / ten tested.
+  const realityTestCount = readIntegerFlag(flags, "reality-test", Math.min(10, topN), 0, 100);
   const realityUploadKb = readIntegerFlag(flags, "reality-upload-kb", 512, 1, 16_384);
   const realityConcurrency = readIntegerFlag(flags, "reality-concurrency", 2, 1, 4);
   const xrayOverride = flags.get("xray");
@@ -480,13 +520,16 @@ async function main() {
   let ctDomains: string[] = [];
   if (flags.has("ct")) {
     if (!ct.enabled) {
-      console.error("[i] main: --no-ct given, skipping the --ct seed discovery too");
+      console.error("[*] main: --no-ct given, skipping the --ct seed discovery too");
     } else {
       const seeds = flags.has("ct-seeds")
         ? flags.get("ct-seeds")!.split(",").map((s) => s.trim()).filter(Boolean)
         : DEFAULT_CT_SEEDS;
       const ctLimit = readIntegerFlag(flags, "ct-limit", 300, 1, 5_000);
-      console.error(`[*] main: querying CT logs for ${seeds.length} seed domain(s) (budget ${ct.budgetMs}ms)...`);
+      setCTLogBrand("ct discovery");
+      console.error(
+        `[*] ct discovery: querying certificate logs for ${seeds.length} seed domains (time limit ${formatMs(ct.budgetMs)})...`,
+      );
       ctDomains = (
         await discoverCTSubdomains(seeds, {
           totalLimit: ctLimit,
@@ -521,8 +564,9 @@ async function main() {
   if (ct.enabled && candidates.length > 0) {
     const prefetchBases = collectBaseDomains(candidates, CT_PREFETCH_BASE_LIMIT);
     if (prefetchBases.length > 0) {
+      setCTLogBrand("phase 1.5");
       console.error(
-        `[i] ctlogs: background CT prefetch started for ${prefetchBases.length} base domain(s) — its log lines print after phase 1`,
+        `[*] phase 1.5: subdomain discovery started in the background for ${prefetchBases.length} domains — its messages print after stage 1`,
       );
       ctPrefetchStop = new AbortController();
       const stopSignal = ctPrefetchStop.signal;
@@ -540,14 +584,18 @@ async function main() {
         .catch((err) => {
           // Never let a background failure reject un-awaited: it would take
           // the whole run down as an unhandled rejection.
-          ctPrefetchLines.push(`[!] ctlogs: background prefetch failed: ${err instanceof Error ? err.message : String(err)}`);
+          ctPrefetchLines.push(
+            `[!] phase 1.5: background discovery failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
         })
         .finally(() => setCTLogger(null));
     }
   }
 
   console.error(`[*] main: probing ${candidates.length} candidates on port ${opts.port} (concurrency ${opts.concurrency})...`);
-  console.error("[i] measurement scope: this process -> candidate. Run this command on the Xray server too to validate the server -> DEST path.");
+  console.error(
+    "[*] main: measuring from this machine to each candidate. To validate your server -> destination path too, run this command on the Xray server itself.",
+  );
 
   let lastPrinted = 0;
   const results = await probeAll(candidates, opts, (done, total) => {
@@ -569,12 +617,19 @@ async function main() {
   // The prefetch has served its purpose once the ranking exists: cancel it
   // (in-flight requests abort immediately, partial results are kept and the
   // cache is written) and replay its buffered log lines. Ordering users see:
-  // phase 1 progress -> results.json written -> prefetch output -> phase 1.5.
+  // phase 1 progress -> results.json written -> phase 1.5 banner -> prefetch
+  // output -> the phase 1.5 discovery for the actual top domains.
+  const phase15Running = ct.enabled && passing.length > 0;
+  if (phase15Running) {
+    console.error(
+      "\n--- phase 1.5: finding subdomains of your best stage 1 domains (they get the same TLS test) ---",
+    );
+  }
   if (ctPrefetch && ctPrefetchStop) {
     ctPrefetchStop.abort();
     await ctPrefetch;
     if (ctPrefetchLines.length > 0) {
-      console.error("[i] ctlogs: background prefetch output (produced during phase 1):");
+      console.error("[*] phase 1.5: background discovery (ran while stage 1 was probing):");
       for (const line of ctPrefetchLines) console.error(line);
     }
   }
@@ -592,6 +647,9 @@ async function main() {
       if (pct > lastPrinted) {
         lastPrinted = Math.min(pct, 39);
         process.stderr.write(`\r[*] progress: ${done}/${total} (phase 1.5)`);
+        // End the \r line the moment the last probe lands, so phase 1.5's
+        // summary lines don't get glued onto the end of the progress line.
+        if (done === total) process.stderr.write("\n");
       }
     });
   } else if (!ct.enabled && passing.length > 0) {
@@ -661,8 +719,8 @@ async function main() {
     const tested = finalCandidates
       .slice(0, realityTestCount)
       .map((r) => ({ hostname: r.hostname, handshakeMs: r.handshakeMs }));
-    console.error(`\n[*] stage 2: starting full Reality tunnel test on top ${tested.length} domains.`);
-    console.error("[*] stage 2: this will launch multiple Xray processes and may take several minutes...");
+    console.error(`\n[*] stage 2: re-testing the top ${tested.length} candidates through a real Reality tunnel...`);
+    console.error("[*] stage 2: each test launches temporary Xray processes (~5-15s each; count set by --reality-test)");
 
     let sawProgress = false;
     let progressLineLength = 0;

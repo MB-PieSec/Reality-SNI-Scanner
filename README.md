@@ -104,8 +104,9 @@ TLS handshake as Stage 1, and the results are merged with Stage 1 (deduplicated
 by base domain). This finds faster, less-common subdomains that make better
 Reality disguises.
 
-Discovery walks a fallback chain under one wall-clock budget (`--ct-timeout`,
-default 10 s): **crt.sh → Cert Spotter → DNS brute-force**. The first source
+Discovery walks a fallback chain under one wall-clock time limit
+(`--ct-timeout`, default 10 s): **crt.sh → Cert Spotter → DNS guessing** (the
+last one probes a bundled wordlist of common subdomain names). The first source
 that returns names for a base domain wins; if a provider is down, times out or
 returns nothing, the next one is tried automatically (a provider that fails is
 skipped for the rest of the run). Everything learned is cached in
@@ -113,9 +114,11 @@ skipped for the rest of the run). Everything learned is cached in
 same domains needs no network at all — `--ct-refresh` forces a refetch and
 `--no-ct` skips Phase 1.5 entirely. Because discovery runs concurrently with
 Stage 1, its log lines (prefetch start, cache hits, source failures) print
-after `results.json` is written, and the Phase 1.5 table header carries a
-`[coverage: ...]` note showing which sources actually answered — including
-`cache` for names served from disk.
+after `results.json` is written under a `--- phase 1.5 ---` section header,
+and every line carries the `phase 1.5:` prefix so you can tell which part of
+the run it belongs to. The Phase 1.5 table header carries a
+`[sources: ...]` note showing which sources actually answered — including
+`cached` for names served from disk.
 
 > [!NOTE]
 > crt.sh is a free, shared service with poor uptime — which is exactly why
@@ -146,8 +149,9 @@ TLS handshake. Domains that fail the tunnel are still listed, with the reason.
 
 This stage costs real time — roughly 5–15 s per candidate, since Xray probes
 the dest while it starts — which is why it only runs on the top candidates.
-`--reality-test <n>` changes how many are tested; `--reality-test 0` skips it
-and leaves you with the Stage 1 table only.
+`--reality-test <n>` changes how many are tested (the default is
+`min(10, --top)`, so `--top 5` means five of everything); `--reality-test 0`
+skips it and leaves you with the Stage 1 table only.
 
 **You do not need to install Xray yourself.** The first time a run uses
 Stage 2, the tool downloads the official Xray-core build for your operating
@@ -237,7 +241,7 @@ Optional discovery sources:
 - `--ct-timeout <ms>` (default `10000`): total wall-clock budget for one CT
   discovery phase, shared by every source, retry and fallback in the chain.
 - `--ct-source <name>` (default `auto`): which source discovery may use —
-  `auto` (crt.sh → Cert Spotter → DNS brute-force), `crtsh`, `certspotter`
+  `auto` (crt.sh → Cert Spotter → DNS guessing), `crtsh`, `certspotter`
   or `dns`.
 - `--ct-refresh`: ignore the `ct-cache.json` disk cache and refetch everything.
 - `--no-ct`: skip Phase 1.5 subdomain discovery entirely.
@@ -254,7 +258,7 @@ Filtering and connection options:
 
 Reality tunnel test (Stage 2):
 
-- `--reality-test <n>` (default `10`): how many top Stage-1 candidates to
+- `--reality-test <n>` (default `min(10, --top)`): how many top candidates to
   re-test through a real tunnel; `0` disables this stage.
 - `--reality-upload-kb <n>` (default `512`): size of the test upload.
 - `--reality-concurrency <n>` (default `2`, max `4`): tunnels to test at once.
@@ -278,7 +282,7 @@ Reality tunnel test (Stage 2):
 | `--timeout <ms>` | 4000 | how long to wait for each domain before giving up |
 | `--asn-timeout <ms>` | 20000 | how long to wait for the automatic network-block lookup (raise this if your connection is slow) |
 | `--ct-timeout <ms>` | 10000 | total wall-clock budget for one CT discovery phase (shared by every source, retry and fallback) |
-| `--ct-source <name>` | auto | which CT source discovery may use: auto (crt.sh → Cert Spotter → DNS brute-force), crtsh, certspotter, dns |
+| `--ct-source <name>` | auto | which CT source discovery may use: auto (crt.sh → Cert Spotter → DNS guessing), crtsh, certspotter, dns |
 | `--ct-refresh` | off | ignore the ct-cache.json disk cache and refetch everything |
 | `--no-ct` | off | skip Phase 1.5 subdomain discovery entirely |
 | `--port <n>` | 443 | which port to test (443 is the standard HTTPS port — leave this alone unless you know why you'd change it) |
@@ -308,8 +312,8 @@ to `results.json`, in case you want to look closer later.
 If Phase 1.5 ran, it prints a table of discovered subdomains before the
 merged results. The `ct-subdomain` source in the final table indicates a
 domain found via the CT discovery chain (crt.sh, Cert Spotter or DNS
-brute-force); the `[coverage: ...]` note in the Phase 1.5 table header shows
-which sources actually answered for this run, `cache` meaning the names came
+guessing); the `[sources: ...]` note in the Phase 1.5 table header shows
+which sources actually answered for this run, `cached` meaning the names came
 from `ct-cache.json` instead of the network.
 
 If Stage 2 ran, it prints a second table underneath: the domain, its handshake
@@ -327,10 +331,10 @@ stages, is in `results.json` under `stage2`.
   (usually GitHub being blocked). The Stage 1 results are still in
   `results.json`; retry later, or point the tool at an Xray you already have
   with `--xray <path>`.
-- **"phase 1.5: ..." source failures, or "no subdomains passed filtering":**
+- **"phase 1.5: ..." source failures, or "none of the ... subdomains passed":**
   CT providers go down regularly (crt.sh in particular), and CT logs contain
   many historical subdomains that no longer exist. Discovery automatically
-  falls back from crt.sh to Cert Spotter to DNS brute-force within the
+  falls back from crt.sh to Cert Spotter to DNS guessing within the
   `--ct-timeout` budget, so a dead provider only costs time — if *every*
   source fails, the run still finishes with Stage 1 + Stage 2 results and a
   per-source reason in the log. Retry later (or run with `--ct-refresh` once
