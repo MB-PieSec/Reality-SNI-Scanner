@@ -1,7 +1,16 @@
 import { writeFile } from "node:fs/promises";
+import path from "node:path";
 import { fetchTopDomains } from "./sources.ts";
 import { discoverNeighborDomains, isSampleableIPv4Cidr, isValidIPv4 } from "./asn.ts";
-import { discoverCTSubdomains, CTDiscoveryMode, DEFAULT_CT_SEEDS } from "./ctlogs.ts";
+import {
+  discoverCTSubdomains,
+  CTDiscoveryMode,
+  CTSource,
+  DEFAULT_CT_SEEDS,
+  DEFAULT_CT_BUDGET_MS,
+  describeCTCoverage,
+  setCTLogger,
+} from "./ctlogs.ts";
 import { probeAll, passesFilters } from "./probe.ts";
 import { ensureXrayBinary } from "./xray.ts";
 import { rankRealityResults, runRealityTests } from "./reality-test.ts";
@@ -47,7 +56,12 @@ Options:
                          (default: microsoft.com,google.com,apple.com,cloudflare.com,
                          amazon.com,akamai.com,fastly.net,wikipedia.org,github.com,mozilla.org)
   --ct-limit <n>         Max total subdomains to pull from CT logs (default 300)
-  --ct-timeout <ms>      Per-seed CT-log query timeout in ms (default 15000)
+  --ct-timeout <ms>      Total wall-clock budget for one CT discovery phase, shared
+                         by every source, retry and fallback (default 10000)
+  --ct-source <name>     Which CT source discovery may use: auto (default — crt.sh,
+                         then Cert Spotter, then DNS brute-force), crtsh, certspotter, dns
+  --ct-refresh           Ignore the ct-cache.json disk cache and refetch everything
+  --no-ct                Skip Phase 1.5 subdomain discovery entirely
   --remote              Fetch a live top-domains list instead of the bundled snapshot
                          (falls back to the snapshot automatically if this fails)
   --candidates <n>      How many candidate domains to try (default 400)
@@ -85,6 +99,9 @@ Notes:
   - Candidates come from a bundled offline snapshot by default, specifically
     so this tool works over your real, unfiltered network path without
     needing a VPN just to build the candidate list.
+  - Phase 1.5 starts its CT discovery in the background while Stage 1 probes,
+    walks crt.sh -> Cert Spotter -> DNS brute-force under one --ct-timeout
+    budget, and caches what it learns in ct-cache.json for 7 days.
   - Run this WITHOUT a VPN/proxy active if your goal is to find SNI/DEST
     targets that work well for clients on your real (filtered) network —
     tunneling the scan itself defeats the purpose.
@@ -168,6 +185,29 @@ function extractBaseDomain(hostname: string): string {
   return parts.slice(-2).join(".");
 }
 
+/**
+ * How many base domains the background CT prefetch may warm up. The candidate
+ * list is rank-ordered, so its earliest bases are the most plausible Stage 1
+ * winners — the prefetch is a best-effort head start, not a guarantee: any
+ * base it misses is fetched (inside the normal budget) once Phase 1's real
+ * ranking exists.
+ */
+const CT_PREFETCH_BASE_LIMIT = 40;
+
+/** Unique base domains of the first `limit` candidates, in list order. */
+function collectBaseDomains(candidates: { hostname: string }[], limit: number): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of candidates) {
+    const base = extractBaseDomain(c.hostname);
+    if (seen.has(base)) continue;
+    seen.add(base);
+    out.push(base);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
 interface Stage2Report {
   options: {
     tested: number;
@@ -213,6 +253,20 @@ function printStage2Table(results: RealityTestResult[]): void {
   }
 }
 
+/** CLI-derived settings shared by every Certificate Transparency lookup. */
+interface CtRuntimeConfig {
+  /** False when --no-ct was given: Phase 1.5 (and --ct seed discovery) stay off. */
+  enabled: boolean;
+  /** Total wall-clock budget for one discovery run (--ct-timeout). */
+  budgetMs: number;
+  /** Which source(s) discovery may use (--ct-source). */
+  source: CTSource;
+  /** Cache file path, kept next to the --out report. */
+  cacheFile: string;
+  /** --ct-refresh: ignore existing cache entries, then rewrite them. */
+  refresh: boolean;
+}
+
 /**
  * Phase 1.5: Discover subdomains for top domains from Stage 1 and probe them.
  * Returns the best-performing subdomains (full ProbeResult), capped at the original top limit.
@@ -221,6 +275,7 @@ async function phase1point5(
   topCandidates: { hostname: string; result: ProbeResult }[],
   opts: ScanOptions,
   topN: number,
+  ct: CtRuntimeConfig,
   onProgress?: (done: number, total: number) => void,
 ): Promise<ProbeResult[]> {
   console.error(`\n[*] phase 1.5: discovering subdomains for top ${Math.min(topN, topCandidates.length)} domains...`);
@@ -229,24 +284,34 @@ async function phase1point5(
     .slice(0, topN)
     .map((c) => c.hostname);
 
-  // Extract base domains (eTLD+1) from main domains for crt.sh queries
+  // Extract base domains (eTLD+1) from main domains for CT queries
   // e.g., "www.google.com" -> "google.com", "apple.com" -> "apple.com"
   const baseDomains = [...new Set(mainDomains.map(extractBaseDomain))];
 
-  console.error(`[*] phase 1.5: querying crt.sh for ${baseDomains.length} base domain(s): ${baseDomains.join(", ")}`);
+  console.error(`[*] phase 1.5: querying CT sources for ${baseDomains.length} base domain(s): ${baseDomains.join(", ")}`);
+  console.error(`[*] phase 1.5: budget ${ct.budgetMs}ms, source ${ct.source}, cache ${path.basename(ct.cacheFile)}`);
 
   try {
-    const discoveredSubdomains = await discoverCTSubdomains(
-      baseDomains,
-      topN * 10, // We'll probe many more candidates than we need
-      5_000, // 5s timeout per request (crt.sh is often slow/down)
-      CTDiscoveryMode.MAIN_DOMAINS,
-    );
+    const discovery = await discoverCTSubdomains(baseDomains, {
+      totalLimit: topN * 10, // We'll probe many more candidates than we need
+      budgetMs: ct.budgetMs,
+      mode: CTDiscoveryMode.MAIN_DOMAINS,
+      source: ct.source,
+      cacheFile: ct.cacheFile,
+      refresh: ct.refresh,
+    });
+    const discoveredSubdomains = discovery.names;
+    const coverage = describeCTCoverage(discovery.bySource);
 
     if (discoveredSubdomains.length === 0) {
-      console.error(`[!] phase 1.5: no subdomains discovered via crt.sh`);
+      console.error(`[!] phase 1.5: no subdomains discovered (crt.sh, Cert Spotter and DNS brute-force all failed)`);
       return [];
     }
+
+    // Say where the names came from: cache/fallback answers mean the CT
+    // enumeration may cover only part of each base domain.
+    console.error(`[*] phase 1.5: source coverage: ${coverage}`);
+    const usedFallback = Object.keys(discovery.bySource).some((s) => s !== "crtsh");
 
     // Probe all discovered subdomains
     console.error(`[*] phase 1.5: probing ${discoveredSubdomains.length} discovered subdomains...`);
@@ -259,6 +324,29 @@ async function phase1point5(
     // Filter passing results and rank them
     const passing = probingResults
       .filter((r) => passesFilters(r, opts));
+
+    // Report *why* the rest were dropped — "0 passed" with no reason is
+    // unactionable (timeout storm? TLS version? ALPN?).
+    if (passing.length < probingResults.length) {
+      const reasons = new Map<string, number>();
+      for (const r of probingResults) {
+        if (passesFilters(r, opts)) continue;
+        const reason = !r.ok
+          ? (r.error ?? "connection failed")
+          : opts.requireTls13 && r.tlsVersion !== "TLSv1.3"
+            ? `tls ${r.tlsVersion ?? "?"}`
+            : opts.requireH2 && r.alpn !== "h2"
+              ? `alpn ${String(r.alpn)}`
+              : opts.requireAuthorized && !r.authorized
+                ? "unauthorized"
+                : "filtered";
+        reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+      }
+      const summary = [...reasons.entries()]
+        .map(([reason, count]) => `${reason.replace(/\s+/g, " ").trim()} x${count}`)
+        .join(", ");
+      console.error(`[!] phase 1.5: filters dropped ${probingResults.length - passing.length} subdomain(s): ${summary}`);
+    }
 
     if (passing.length === 0) {
       console.error(`[!] phase 1.5: no subdomains passed filtering`);
@@ -285,7 +373,10 @@ async function phase1point5(
       cells
         .map((v, i) => v.padEnd(Object.values(widths)[i]))
         .join("");
-    console.log(`\nPhase 1.5 — best subdomains (${selectedSubdomains.length}/${passing.length}):\n`);
+    // Surface a fallback/cache-backed result in the header itself, so nobody
+    // mistakes DNS-wordlist coverage for a full CT enumeration.
+    const headerNote = usedFallback && coverage ? ` [coverage: ${coverage}]` : "";
+    console.log(`\nPhase 1.5 — best subdomains (${selectedSubdomains.length}/${passing.length})${headerNote}:\n`);
     console.log(row(["#", "hostname", "tls", "alpn", "ms", "authorized"]));
     selectedSubdomains.forEach((r, i) => {
       console.log(
@@ -338,6 +429,27 @@ async function main() {
     throw new Error("--xray requires a path to an Xray binary");
   }
 
+  // ---------------------------------------------------- Certificate Transparency
+  // --ct-timeout is ONE wall-clock budget per discovery run, shared by every
+  // source, retry and fallback in the chain, so a dead provider can never
+  // stack up (N base domains x attempts x per-request timeout) on a big scan.
+  const rawCtSource = flags.get("ct-source");
+  if (rawCtSource === "true") {
+    throw new Error("--ct-source requires one of: auto, crtsh, certspotter, dns");
+  }
+  const ctSource = (rawCtSource ?? CTSource.AUTO) as CTSource;
+  if (!Object.values(CTSource).includes(ctSource)) {
+    throw new Error("--ct-source must be one of: auto, crtsh, certspotter, dns");
+  }
+  const ct: CtRuntimeConfig = {
+    enabled: !flags.has("no-ct"),
+    budgetMs: readIntegerFlag(flags, "ct-timeout", DEFAULT_CT_BUDGET_MS, 1_000, 600_000),
+    source: ctSource,
+    // Kept next to the report: whatever --out points at, the cache sits beside it.
+    cacheFile: path.join(path.dirname(outFile), "ct-cache.json"),
+    refresh: flags.has("ct-refresh"),
+  };
+
   if (useNeighbors && !targetIp && !explicitPrefix) {
     console.error("[x] Error: --neighbors requires --target <ip> (or --prefix <cidr> to skip the lookup)");
     process.exit(1);
@@ -367,13 +479,25 @@ async function main() {
 
   let ctDomains: string[] = [];
   if (flags.has("ct")) {
-    const seeds = flags.has("ct-seeds")
-      ? flags.get("ct-seeds")!.split(",").map((s) => s.trim()).filter(Boolean)
-      : DEFAULT_CT_SEEDS;
-    const ctLimit = readIntegerFlag(flags, "ct-limit", 300, 1, 5_000);
-    const ctTimeoutMs = readIntegerFlag(flags, "ct-timeout", 15_000, 100, 300_000);
-    console.error(`[*] main: querying CT logs for ${seeds.length} seed domain(s)...`);
-    ctDomains = await discoverCTSubdomains(seeds, ctLimit, ctTimeoutMs);
+    if (!ct.enabled) {
+      console.error("[i] main: --no-ct given, skipping the --ct seed discovery too");
+    } else {
+      const seeds = flags.has("ct-seeds")
+        ? flags.get("ct-seeds")!.split(",").map((s) => s.trim()).filter(Boolean)
+        : DEFAULT_CT_SEEDS;
+      const ctLimit = readIntegerFlag(flags, "ct-limit", 300, 1, 5_000);
+      console.error(`[*] main: querying CT logs for ${seeds.length} seed domain(s) (budget ${ct.budgetMs}ms)...`);
+      ctDomains = (
+        await discoverCTSubdomains(seeds, {
+          totalLimit: ctLimit,
+          budgetMs: ct.budgetMs,
+          mode: CTDiscoveryMode.SEEDS,
+          source: ct.source,
+          cacheFile: ct.cacheFile,
+          refresh: ct.refresh,
+        })
+      ).names;
+    }
   }
 
   const candidates = dedupeCandidates([
@@ -381,6 +505,46 @@ async function main() {
     ...neighborDomains.map((hostname) => ({ hostname, source: "asn-neighbor" as const })),
     ...ctDomains.map((hostname) => ({ hostname, source: "ct-log" as const })),
   ]);
+
+  // ----------------------------------------------------------- CT prefetch
+  // Phase 1.5 can only ask about the bases of Phase 1's *winners*, which are
+  // unknown until Phase 1 finishes — but the expensive half of CT discovery
+  // (provider latency, a cold cache) does not depend on which bases win. So
+  // start a speculative prefetch over the first candidate bases now, with its
+  // log lines buffered so they cannot garble the \r progress line, and stop
+  // it the moment Phase 1's ranking is ready. Phase 1.5 then reuses whatever
+  // this warmed up and fetches the rest inside its own budget, so the serial
+  // cost added after Phase 1 is still at most one budget window.
+  let ctPrefetch: Promise<void> | null = null;
+  let ctPrefetchStop: AbortController | null = null;
+  const ctPrefetchLines: string[] = [];
+  if (ct.enabled && candidates.length > 0) {
+    const prefetchBases = collectBaseDomains(candidates, CT_PREFETCH_BASE_LIMIT);
+    if (prefetchBases.length > 0) {
+      console.error(
+        `[i] ctlogs: background CT prefetch started for ${prefetchBases.length} base domain(s) — its log lines print after phase 1`,
+      );
+      ctPrefetchStop = new AbortController();
+      const stopSignal = ctPrefetchStop.signal;
+      setCTLogger((line) => ctPrefetchLines.push(line));
+      ctPrefetch = discoverCTSubdomains(prefetchBases, {
+        totalLimit: 400,
+        budgetMs: ct.budgetMs,
+        mode: CTDiscoveryMode.MAIN_DOMAINS,
+        source: ct.source,
+        cacheFile: ct.cacheFile,
+        refresh: ct.refresh,
+        signal: stopSignal,
+      })
+        .then(() => undefined)
+        .catch((err) => {
+          // Never let a background failure reject un-awaited: it would take
+          // the whole run down as an unhandled rejection.
+          ctPrefetchLines.push(`[!] ctlogs: background prefetch failed: ${err instanceof Error ? err.message : String(err)}`);
+        })
+        .finally(() => setCTLogger(null));
+    }
+  }
 
   console.error(`[*] main: probing ${candidates.length} candidates on port ${opts.port} (concurrency ${opts.concurrency})...`);
   console.error("[i] measurement scope: this process -> candidate. Run this command on the Xray server too to validate the server -> DEST path.");
@@ -402,21 +566,36 @@ async function main() {
   await writeFile(outFile, JSON.stringify({ options: opts, results }, null, 2));
   console.error(`[+] main: full results (including failures) written to ${outFile}`);
 
+  // The prefetch has served its purpose once the ranking exists: cancel it
+  // (in-flight requests abort immediately, partial results are kept and the
+  // cache is written) and replay its buffered log lines. Ordering users see:
+  // phase 1 progress -> results.json written -> prefetch output -> phase 1.5.
+  if (ctPrefetch && ctPrefetchStop) {
+    ctPrefetchStop.abort();
+    await ctPrefetch;
+    if (ctPrefetchLines.length > 0) {
+      console.error("[i] ctlogs: background prefetch output (produced during phase 1):");
+      for (const line of ctPrefetchLines) console.error(line);
+    }
+  }
+
   // ---------------------------------------------------------------- Phase 1.5
   // Discover subdomains for top-stage-1 domains and probe them
   let subdomainResults: ProbeResult[] = [];
-  if (passing.length > 0) {
+  if (ct.enabled && passing.length > 0) {
     const stage1TopHostnames = passing
       .slice(0, topN)
       .map((r) => ({ hostname: r.hostname, result: r }));
 
-    subdomainResults = await phase1point5(stage1TopHostnames, opts, topN, (done, total) => {
+    subdomainResults = await phase1point5(stage1TopHostnames, opts, topN, ct, (done, total) => {
       const pct = Math.floor((done / total) / 2 * 20) + 20; // Append to Stage 1 progress
       if (pct > lastPrinted) {
         lastPrinted = Math.min(pct, 39);
         process.stderr.write(`\r[*] progress: ${done}/${total} (phase 1.5)`);
       }
     });
+  } else if (!ct.enabled && passing.length > 0) {
+    console.error("[*] phase 1.5: skipped (--no-ct)");
   }
   process.stderr.write("\n");
 

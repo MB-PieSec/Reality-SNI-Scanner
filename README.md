@@ -96,17 +96,32 @@ TLS 1.3 connection and checks the four things listed above. It takes seconds,
 downloads nothing, and works with no arguments at all: `node run.js`. This is
 the first table it prints.
 
-**Stage 1.5 — subdomain discovery (optional).** After Stage 1, the tool takes
-the top domains and searches Certificate Transparency logs (via crt.sh) for
-their subdomains (e.g., `www.google.com` → `accounts.google.com`,
+**Stage 1.5 — subdomain discovery (optional).** Discovery starts in the
+background while Stage 1 probes, then the tool takes the top domains and
+searches for their subdomains (e.g., `www.google.com` → `accounts.google.com`,
 `mail.google.com`, etc.). Each discovered subdomain gets probed with the same
 TLS handshake as Stage 1, and the results are merged with Stage 1 (deduplicated
 by base domain). This finds faster, less-common subdomains that make better
 Reality disguises.
 
+Discovery walks a fallback chain under one wall-clock budget (`--ct-timeout`,
+default 10 s): **crt.sh → Cert Spotter → DNS brute-force**. The first source
+that returns names for a base domain wins; if a provider is down, times out or
+returns nothing, the next one is tried automatically (a provider that fails is
+skipped for the rest of the run). Everything learned is cached in
+`ct-cache.json` next to `results.json` for 7 days, so a repeat scan of the
+same domains needs no network at all — `--ct-refresh` forces a refetch and
+`--no-ct` skips Phase 1.5 entirely. Because discovery runs concurrently with
+Stage 1, its log lines (prefetch start, cache hits, source failures) print
+after `results.json` is written, and the Phase 1.5 table header carries a
+`[coverage: ...]` note showing which sources actually answered — including
+`cache` for names served from disk.
+
 > [!NOTE]
-> crt.sh is a free, shared service with ~40% uptime. If it's down, Phase 1.5
-> will be skipped automatically and you'll still get Stage 1 + Stage 2 results.
+> crt.sh is a free, shared service with poor uptime — which is exactly why
+> it is only the *first* source in the chain. If every source fails,
+> Phase 1.5 reports the reasons and the run continues with Stage 1 + Stage 2
+> results.
 
 **Stage 2 — a full Reality tunnel test.** Answering TLS is not automatically
 enough to be a usable Reality `dest`. Xray does one extra thing with that
@@ -219,7 +234,13 @@ Optional discovery sources:
 - `--ct`: add Certificate Transparency subdomains.
 - `--ct-seeds <list>`: comma-separated domains to search in CT logs.
 - `--ct-limit <n>` (default `300`): maximum CT domains collected; each response is capped at 5 MiB.
-- `--ct-timeout <ms>` (default `15000`): time allowed for each CT lookup.
+- `--ct-timeout <ms>` (default `10000`): total wall-clock budget for one CT
+  discovery phase, shared by every source, retry and fallback in the chain.
+- `--ct-source <name>` (default `auto`): which source discovery may use —
+  `auto` (crt.sh → Cert Spotter → DNS brute-force), `crtsh`, `certspotter`
+  or `dns`.
+- `--ct-refresh`: ignore the `ct-cache.json` disk cache and refetch everything.
+- `--no-ct`: skip Phase 1.5 subdomain discovery entirely.
 - `--asn-timeout <ms>` (default `20000`): time allowed for an automatic network-block lookup.
 - `--remote`: try a fresh online top-domains list before falling back to the bundled list.
 
@@ -256,7 +277,10 @@ Reality tunnel test (Stage 2):
 | `--concurrency <n>` | 40 | how many domains to test at the same time |
 | `--timeout <ms>` | 4000 | how long to wait for each domain before giving up |
 | `--asn-timeout <ms>` | 20000 | how long to wait for the automatic network-block lookup (raise this if your connection is slow) |
-| `--ct-timeout <ms>` | 15000 | how long to wait per company when searching CT logs |
+| `--ct-timeout <ms>` | 10000 | total wall-clock budget for one CT discovery phase (shared by every source, retry and fallback) |
+| `--ct-source <name>` | auto | which CT source discovery may use: auto (crt.sh → Cert Spotter → DNS brute-force), crtsh, certspotter, dns |
+| `--ct-refresh` | off | ignore the ct-cache.json disk cache and refetch everything |
+| `--no-ct` | off | skip Phase 1.5 subdomain discovery entirely |
 | `--port <n>` | 443 | which port to test (443 is the standard HTTPS port — leave this alone unless you know why you'd change it) |
 | `--top <n>` | 15 | how many results to show |
 | `--out <file>` | results.json | where to save the full results, including failed ones |
@@ -283,7 +307,10 @@ to `results.json`, in case you want to look closer later.
 
 If Phase 1.5 ran, it prints a table of discovered subdomains before the
 merged results. The `ct-subdomain` source in the final table indicates a
-domain found via Certificate Transparency logs.
+domain found via the CT discovery chain (crt.sh, Cert Spotter or DNS
+brute-force); the `[coverage: ...]` note in the Phase 1.5 table header shows
+which sources actually answered for this run, `cache` meaning the names came
+from `ct-cache.json` instead of the network.
 
 If Stage 2 ran, it prints a second table underneath: the domain, its handshake
 time, the upload speed measured through the tunnel in kbps, and
@@ -300,10 +327,14 @@ stages, is in `results.json` under `stage2`.
   (usually GitHub being blocked). The Stage 1 results are still in
   `results.json`; retry later, or point the tool at an Xray you already have
   with `--xray <path>`.
-- **"phase 1.5: no subdomains discovered via crt.sh":** crt.sh is a free,
-  shared service with ~40% uptime. This is normal — Phase 1.5 will be
-  skipped and you'll still get Stage 1 + Stage 2 results. Retry later if
-  you want subdomain discovery.
+- **"phase 1.5: ..." source failures, or "no subdomains passed filtering":**
+  CT providers go down regularly (crt.sh in particular), and CT logs contain
+  many historical subdomains that no longer exist. Discovery automatically
+  falls back from crt.sh to Cert Spotter to DNS brute-force within the
+  `--ct-timeout` budget, so a dead provider only costs time — if *every*
+  source fails, the run still finishes with Stage 1 + Stage 2 results and a
+  per-source reason in the log. Retry later (or run with `--ct-refresh` once
+  providers are healthy) if you want subdomain discovery.
 - **No qualifying domains:** try a larger candidate pool, for example
   `node run.js --candidates 1000`. For troubleshooting only, you can relax
   the HTTP/2 requirement with `--no-require-h2`.
