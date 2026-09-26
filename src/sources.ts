@@ -18,6 +18,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { normalizeAcceptableDomain } from "./filters.ts";
+import { forPhase } from "./log.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BUNDLED_LIST_PATH = path.join(__dirname, "data", "top-domains.json");
@@ -80,9 +81,8 @@ export async function fetchTopDomains(
     try {
       return await fetchRemote(limit, remoteTimeoutMs);
     } catch (err) {
-      console.error(
-        `[!] sources: live fetch failed (${(err as Error).message}), falling back to bundled snapshot`,
-      );
+      const log = forPhase("sources");
+      log.warn(`live fetch failed (${(err as Error).message}), falling back to bundled snapshot`);
     }
   }
   return loadBundled(limit);

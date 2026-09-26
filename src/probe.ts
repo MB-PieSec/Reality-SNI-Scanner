@@ -90,12 +90,12 @@ async function probeOne(
   const start = performance.now();
   const remaining = () => timeoutMs - (performance.now() - start);
 
-  // Phase 1: name resolution (stall-proof path, see resolveAddresses).
+  // Step 1: name resolution (stall-proof path, see resolveAddresses).
   const resolved = await resolveAddresses(hostname, remaining());
   if (resolved.kind === "timeout") return { ok: false, error: "timeout" };
   if (resolved.kind === "error") return { ok: false, error: resolved.message };
 
-  // Phase 2: TLS handshake, with whatever is left of the probe budget.
+  // Step 2: TLS handshake, with whatever is left of the probe budget.
   const budget = Math.max(1, Math.round(remaining()));
   return new Promise((resolve) => {
     let settled = false;

@@ -1,5 +1,6 @@
 import dns from "node:dns/promises";
 import { normalizeAcceptableDomain } from "./filters.ts";
+import { forPhase } from "./log.ts";
 
 export function isValidIPv4(ip: string): boolean {
   const octets = ip.split(".");
@@ -66,6 +67,7 @@ async function getAnnouncedPrefix(ip: string, timeoutMs: number): Promise<string
     ["bgpview.io", tryBgpView],
     ["stat.ripe.net", tryRipeStat],
   ];
+  const log = forPhase("asn");
   for (const [name, fn] of providers) {
     try {
       const prefix = await fn(ip, timeoutMs);
@@ -73,7 +75,7 @@ async function getAnnouncedPrefix(ip: string, timeoutMs: number): Promise<string
     } catch (err) {
       const cause = (err as { cause?: { message?: string; code?: string } })?.cause;
       const detail = cause?.code ?? cause?.message ?? (err as Error).message;
-      console.error(`[!] asn: ${name} lookup failed: ${detail}`);
+      log.warn(`${name} lookup failed: ${detail}`);
     }
   }
   return null;
@@ -126,16 +128,17 @@ export async function discoverNeighborDomains(
   lookupTimeoutMs = 20_000,
   explicitPrefix?: string,
 ): Promise<string[]> {
+  const log = forPhase("asn");
   const prefix = explicitPrefix ?? (await getAnnouncedPrefix(targetIp, lookupTimeoutMs));
   if (!prefix) {
-    console.error(
-      "[!] asn: no announced prefix found (both lookup providers failed or timed out) — " +
+    log.warn(
+      "no announced prefix found (both lookup providers failed or timed out) — " +
         "skipping neighbor discovery. You can bypass this with --prefix <cidr> if you " +
         "know your provider's block (check their docs / WHOIS from another machine).",
     );
     return [];
   }
-  console.error(`[*] asn: ${targetIp} sits in ${prefix}, sampling ${sampleSize} IPs for PTR records...`);
+  log.info(`${targetIp} sits in ${prefix}, sampling ${sampleSize} IPs for PTR records...`);
 
   const ips = sampleIPsInCIDR(prefix, sampleSize);
   const hostnames = new Set<string>();
@@ -158,7 +161,10 @@ export async function discoverNeighborDomains(
   }
   await Promise.all(Array.from({ length: Math.min(concurrency, ips.length) }, worker));
 
-  const symbol = hostnames.size > 0 ? "[+]" : "[!]";
-  console.error(`${symbol} asn: found ${hostnames.size} candidate hostname(s) via reverse DNS`);
+  if (hostnames.size > 0) {
+    log.success(`found ${hostnames.size} candidate hostname(s) via reverse DNS`);
+  } else {
+    log.warn("found 0 candidate hostname(s) via reverse DNS");
+  }
   return [...hostnames];
 }

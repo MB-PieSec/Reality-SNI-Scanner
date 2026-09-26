@@ -19,6 +19,8 @@
  * regardless of which spelling it was compiled against.
  */
 
+import { getVerbosity, Level } from "./log.ts";
+
 export const REALITY_TEST_PRIVATE_KEY = "eJVUNNH62lv0FnchEtrhOkG6nzztY6WZX4s9j1dHJ0I";
 export const REALITY_TEST_PUBLIC_KEY = "hOXNwoBqG4eAJcKAOSq4XWCkSM7KmN32B2rHZAVhDTM";
 /** Hex, 8 chars — spells "mono". Zero-padded to 8 bytes identically on both sides. */
@@ -65,9 +67,10 @@ export function buildServerConfig(params: ServerConfigParams): unknown {
           network: "tcp",
           security: "reality",
           realitySettings: {
-            // Off by default. REALITY_DEBUG_LOG=1 turns on the verbose per-record
-            // handshake trace (which record the dest sent, where it aborted).
-            show: Boolean(process.env.REALITY_DEBUG_LOG),
+            // Off by default. --verbose (or REALITY_DEBUG_LOG=1) turns on the
+            // verbose per-record handshake trace (which record the dest sent,
+            // where it aborted).
+            show: getVerbosity() >= Level.Debug || Boolean(process.env.REALITY_DEBUG_LOG),
             dest: `${hostname}:${destPort}`,
             xver: 0,
             serverNames: [hostname],

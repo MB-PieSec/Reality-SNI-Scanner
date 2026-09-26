@@ -112,18 +112,19 @@ returns nothing, the next one is tried automatically (a provider that fails is
 skipped for the rest of the run). Everything learned is cached in
 `ct-cache.json` next to `results.json` for 7 days, so a repeat scan of the
 same domains needs no network at all — `--ct-refresh` forces a refetch and
-`--no-ct` skips Phase 1.5 entirely. Because discovery runs concurrently with
-Stage 1, its log lines (prefetch start, cache hits, source failures) print
-after `results.json` is written under a `--- phase 1.5 ---` section header,
-and every line carries the `phase 1.5:` prefix so you can tell which part of
-the run it belongs to. The Phase 1.5 table header carries a
+`--no-ct` skips Stage 1.5 entirely. Because discovery runs concurrently with
+Stage 1, its log lines (prefetch start, cache hits, source failures) are
+buffered and replayed after `results.json` is written, under a
+`--- stage 1.5 ---` section banner, and every line carries the
+`stage 1.5:` prefix so you can tell which part of
+the run it belongs to. The Stage 1.5 table header carries a
 `[sources: ...]` note showing which sources actually answered — including
 `cached` for names served from disk.
 
 > [!NOTE]
 > crt.sh is a free, shared service with poor uptime — which is exactly why
 > it is only the *first* source in the chain. If every source fails,
-> Phase 1.5 reports the reasons and the run continues with Stage 1 + Stage 2
+> Stage 1.5 reports the reasons and the run continues with Stage 1 + Stage 2
 > results.
 
 **Stage 2 — a full Reality tunnel test.** Answering TLS is not automatically
@@ -244,9 +245,34 @@ Optional discovery sources:
   `auto` (crt.sh → Cert Spotter → DNS guessing), `crtsh`, `certspotter`
   or `dns`.
 - `--ct-refresh`: ignore the `ct-cache.json` disk cache and refetch everything.
-- `--no-ct`: skip Phase 1.5 subdomain discovery entirely.
+- `--no-ct`: skip Stage 1.5 subdomain discovery entirely.
 - `--asn-timeout <ms>` (default `20000`): time allowed for an automatic network-block lookup.
 - `--remote`: try a fresh online top-domains list before falling back to the bundled list.
+
+Output and verbosity:
+
+- `--verbose`, `-v`: also print `[~]` debug lines — Stage 2 port assignments,
+  connect phases and the full Xray server/client logs for every candidate.
+  `REALITY_DEBUG_LOG=1` is accepted as an alias.
+- `--quiet`, `-q`: print only `[x]` error lines to stderr. Result tables on
+  stdout are unaffected.
+- `--help`: print all options.
+
+Everything meant for a human goes to **stderr**; **stdout** carries only the
+result tables and the final suggestion, so `node run.js > scan.txt` captures
+the tables alone. Each stderr line is prefixed with a level marker and the
+stage or module that wrote it:
+
+| marker | meaning |
+| --- | --- |
+| `[i]` | info — what is happening right now |
+| `[+]` | success — something completed well |
+| `[!]` | warn — something failed, but the run continues |
+| `[x]` | error — something failed and the run stopped or degraded |
+| `[~]` | debug — verbose internals, only with `--verbose` |
+
+Stage transitions are announced with a `--- stage N: ... ---` banner, and
+progress bars redraw in place on a single line that always ends in a newline.
 
 Filtering and connection options:
 
@@ -254,7 +280,6 @@ Filtering and connection options:
 - `--no-require-h2`: allow domains that do not negotiate HTTP/2.
 - `--no-require-tls13`: allow domains that do not negotiate TLS 1.3.
 - `--require-authorized`: require a publicly trusted certificate chain.
-- `--help`: print all options.
 
 Reality tunnel test (Stage 2):
 
@@ -284,7 +309,7 @@ Reality tunnel test (Stage 2):
 | `--ct-timeout <ms>` | 10000 | total wall-clock budget for one CT discovery phase (shared by every source, retry and fallback) |
 | `--ct-source <name>` | auto | which CT source discovery may use: auto (crt.sh → Cert Spotter → DNS guessing), crtsh, certspotter, dns |
 | `--ct-refresh` | off | ignore the ct-cache.json disk cache and refetch everything |
-| `--no-ct` | off | skip Phase 1.5 subdomain discovery entirely |
+| `--no-ct` | off | skip Stage 1.5 subdomain discovery entirely |
 | `--port <n>` | 443 | which port to test (443 is the standard HTTPS port — leave this alone unless you know why you'd change it) |
 | `--top <n>` | 15 | how many results to show |
 | `--out <file>` | results.json | where to save the full results, including failed ones |
@@ -309,10 +334,10 @@ censors are most likely to have specifically profiled.
 The full results (including every domain that failed, and why) are saved
 to `results.json`, in case you want to look closer later.
 
-If Phase 1.5 ran, it prints a table of discovered subdomains before the
+If Stage 1.5 ran, it prints a table of discovered subdomains before the
 merged results. The `ct-subdomain` source in the final table indicates a
 domain found via the CT discovery chain (crt.sh, Cert Spotter or DNS
-guessing); the `[sources: ...]` note in the Phase 1.5 table header shows
+guessing); the `[sources: ...]` note in the Stage 1.5 table header shows
 which sources actually answered for this run, `cached` meaning the names came
 from `ct-cache.json` instead of the network.
 
@@ -331,7 +356,7 @@ stages, is in `results.json` under `stage2`.
   (usually GitHub being blocked). The Stage 1 results are still in
   `results.json`; retry later, or point the tool at an Xray you already have
   with `--xray <path>`.
-- **"phase 1.5: ..." source failures, or "none of the ... subdomains passed":**
+- **"stage 1.5: ..." source failures, or "none of the ... subdomains passed":**
   CT providers go down regularly (crt.sh in particular), and CT logs contain
   many historical subdomains that no longer exist. Discovery automatically
   falls back from crt.sh to Cert Spotter to DNS guessing within the

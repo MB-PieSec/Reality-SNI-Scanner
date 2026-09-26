@@ -1,6 +1,7 @@
 import { readFile, writeFile } from "node:fs/promises";
 import { resolve4, resolve6 } from "node:dns/promises";
 import { normalizeAcceptableDomain } from "./filters.ts";
+import { forPhase, STAGES, type Logger } from "./log.ts";
 
 /**
  * Every publicly-trusted TLS certificate ever issued is permanently logged
@@ -90,35 +91,9 @@ async function readJsonWithinLimit(res: Response): Promise<unknown> {
 }
 
 // ------------------------------------------------------------------- logging
-// Phase 1 draws its progress as a single \r line on stderr. CT work running
-// in the background (the prefetch) would otherwise print straight into the
-// middle of that half-drawn line, so callers can swap in a buffering logger
-// while the prefetch runs and replay the captured lines afterwards.
-export type CTLogger = (line: string) => void;
+// Use the unified logger from log.ts. Callers pass a phase name via the
+// `mode` option (or we default to "ct discovery" for seed mode).
 
-const directLogger: CTLogger = (line) => console.error(line);
-let log: CTLogger = directLogger;
-
-/** Replaces the CT log sink; pass null to restore the default (stderr). */
-export function setCTLogger(fn: CTLogger | null): void {
-  log = fn ?? directLogger;
-}
-
-/**
- * What discovery calls itself in log lines. Seed discovery (--ct, which runs
- * before Phase 1) stays "ct discovery"; everything Phase 1.5 does — the
- * background prefetch and the phase itself — brands itself "phase 1.5", so
- * one phase means one prefix and every line says where it came from.
- */
-let logBrand = "ct discovery";
-export function setCTLogBrand(brand: string): void {
-  logBrand = brand;
-}
-const info = (msg: string) => log(`[*] ${logBrand}: ${msg}`);
-const warn = (msg: string) => log(`[!] ${logBrand}: ${msg}`);
-const succeeded = (msg: string) => log(`[+] ${logBrand}: ${msg}`);
-
-// ------------------------------------------------------------------- sources
 /**
  * Which certificate-transparency source a discovery run may use.
  * - "auto": the full fallback chain (crt.sh -> certspotter -> dns)
@@ -162,7 +137,7 @@ export function describeCTCoverage(bySource: Record<string, number>): string {
  * Bundled wordlist for the DNS brute-force floor: resolve `<word>.<base>`
  * and keep the ones that answer. This can only find labels it already knows
  * about — it is deliberately NOT a full enumeration (that's what the CT
- * sources are for) — it exists purely so Phase 1.5 is never empty-handed
+ * sources are for) — it exists purely so Stage 1.5 is never empty-handed
  * when both CT providers are unreachable. No download, no API, works offline
  * as long as DNS itself answers.
  */
@@ -213,12 +188,12 @@ interface CTCacheState {
   dirty: boolean;
 }
 
-// One cache per process: the background prefetch and the later Phase 1.5 run
+// One cache per process: the background prefetch and the later Stage 1.5 run
 // share it, so anything the prefetch already fetched is a cache hit for
-// Phase 1.5 without a second disk read (or a second HTTP request).
+// Stage 1.5 without a second disk read (or a second HTTP request).
 let cacheState: CTCacheState | null = null;
 
-async function loadCache(file: string): Promise<CTCacheState> {
+async function loadCache(file: string, log: ReturnType<typeof forPhase>): Promise<CTCacheState> {
   if (cacheState && cacheState.file === file) return cacheState;
 
   const state: CTCacheState = { file, entries: new Map(), dirty: false };
@@ -230,7 +205,7 @@ async function loadCache(file: string): Promise<CTCacheState> {
     // ENOENT is the normal first run; anything else (permissions, ...) just
     // means "no usable cache" — refetch rather than fail.
     if (code !== "ENOENT") {
-      warn(`cannot read cache file ${file} (${code ?? (err as Error).message}) — fetching fresh results`);
+      log.warn(`cannot read cache file ${file} (${code ?? (err as Error).message}) — fetching fresh results`);
     }
   }
 
@@ -248,10 +223,10 @@ async function loadCache(file: string): Promise<CTCacheState> {
           });
         }
       } else {
-        info(`cache file ${file} is malformed — ignoring it, fetching fresh results`);
+        log.info(`cache file ${file} is malformed — ignoring it, fetching fresh results`);
       }
     } catch {
-      info(`cache file ${file} is corrupt — ignoring it, fetching fresh results`);
+      log.info(`cache file ${file} is corrupt — ignoring it, fetching fresh results`);
     }
   }
 
@@ -260,14 +235,14 @@ async function loadCache(file: string): Promise<CTCacheState> {
 }
 
 /** Best-effort write: a full disk or read-only checkout must not kill a scan. */
-async function saveCache(state: CTCacheState): Promise<void> {
+async function saveCache(state: CTCacheState, log: ReturnType<typeof forPhase>): Promise<void> {
   if (!state.dirty || state.entries.size === 0) return;
   try {
     const body = JSON.stringify({ version: 1, entries: Object.fromEntries(state.entries) }, null, 2);
     await writeFile(state.file, body);
     state.dirty = false;
   } catch (err) {
-    warn(`cannot write cache file ${state.file}: ${(err as Error).message} (this run still works, it just won't be remembered)`);
+    log.warn(`cannot write cache file ${state.file}: ${(err as Error).message} (this run still works, it just won't be remembered)`);
   }
 }
 
@@ -289,6 +264,8 @@ interface SourceContext {
   deadline: number;
   /** Aborted when the budget expires or the caller cancels the run. */
   signal: AbortSignal;
+  /** Phase logger, so retries/warnings report under the caller's brand. */
+  log: Logger;
 }
 
 /**
@@ -410,7 +387,7 @@ async function queryCrtSh(base: string, ctx: SourceContext, limit: number, maxRe
           if (!Number.isFinite(delay) || delay < 0) delay = Math.min(500 * attempt, 2000);
           // Never schedule a retry the budget cannot afford.
           if (Date.now() + delay >= ctx.deadline) throw new Error(`HTTP ${res.status}`);
-          warn(`${base}: HTTP ${res.status} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+          ctx.log.warn(`${base}: HTTP ${res.status} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
           await Promise.race([sleep(delay), abortPromise(ctx.signal)]);
           continue;
         }
@@ -442,7 +419,7 @@ async function queryCrtSh(base: string, ctx: SourceContext, limit: number, maxRe
       if (attempt < maxRetries && (isTimeout || isNetwork)) {
         const delay = Math.min(500 * attempt, 2000);
         if (Date.now() + delay >= ctx.deadline) throw lastError;
-        warn(`${base}: ${lastError.message} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
+        ctx.log.warn(`${base}: ${lastError.message} — retrying in ${delay}ms (attempt ${attempt}/${maxRetries})`);
         await Promise.race([sleep(delay), abortPromise(ctx.signal)]);
         continue;
       }
@@ -544,7 +521,7 @@ async function queryDnsBrute(base: string, ctx: SourceContext, limit: number): P
   for (const label of [`zzk1ctscan${stamp}`, `zzk2ctscan${stamp}`]) {
     if (ctx.signal.aborted) return [];
     if (await dnsResolves(`${label}.${base}`, ctx)) {
-      warn(`${base}: skipping DNS guessing — random test names also resolve here (wildcard DNS), so guessed names would be fake`);
+      ctx.log.warn(`${base}: skipping DNS guessing — random test names also resolve here (wildcard DNS), so guessed names would be fake`);
       return [];
     }
   }
@@ -573,7 +550,7 @@ async function queryDnsBrute(base: string, ctx: SourceContext, limit: number): P
   // The chain's fallthrough log skips DNS (this function is its voice), so
   // an empty sweep is explained here — unless it was cut short by cancel.
   if (found.size === 0 && !ctx.signal.aborted) {
-    info(`${base}: DNS guessing found no subdomains`);
+    ctx.log.info(`${base}: DNS guessing found no subdomains`);
   }
   return [...found];
 }
@@ -588,7 +565,7 @@ async function runSource(id: CTSourceId, base: string, ctx: SourceContext, limit
 /**
  * Mode for subdomain discovery.
  * - "seeds": Query CT sources for new domains from a list of seed domains (original behavior)
- * - "main-domains": Phase 1.5 — discover subdomains of the Phase 1 top domains
+ * - "main-domains": Stage 1.5 — discover subdomains of the Stage 1 top domains
  */
 export const CTDiscoveryMode = {
   SEEDS: "seeds" as const,
@@ -609,8 +586,15 @@ export interface CTDiscoverOptions {
   cacheFile?: string;
   /** Ignore cache entries and refetch (the fresh result rewrites them). */
   refresh?: boolean;
-  /** External cancel — used to stop the background prefetch when Phase 1 ends. */
+  /** External cancel — used to stop the background prefetch when Stage 1 ends. */
   signal?: AbortSignal;
+  /**
+   * Logger for this run's lines. Defaults to forPhase(mode), but callers with
+   * a buffering logger (the background prefetch, which must not print into
+   * Stage 1's live \r progress line) pass theirs here instead of swapping a
+   * global sink around.
+   */
+  logger?: Logger;
 }
 
 export interface CTDiscoveryResult {
@@ -649,6 +633,12 @@ export async function discoverCTSubdomains(
   const budgetMs = opts.budgetMs ?? DEFAULT_CT_BUDGET_MS;
   const source = opts.source ?? CTSource.AUTO;
   const refresh = opts.refresh ?? false;
+  const mode = opts.mode ?? CTDiscoveryMode.SEEDS;
+
+  // Create a logger for this discovery run: the caller's (e.g. the buffering
+  // prefetch logger), else one named after this run's mode.
+  const log = opts.logger ?? forPhase(mode === CTDiscoveryMode.SEEDS ? "ct seed" : STAGES[1]);
+
   const chain: CTSourceId[] =
     source === CTSource.AUTO ? [...CT_SOURCE_CHAIN] : [source];
   // Split the total name budget evenly across the base domains: without this,
@@ -703,7 +693,7 @@ export async function discoverCTSubdomains(
   try {
     // Loaded inside the try so even a pathological cache problem still lands
     // in the finally below (timer cleared, partial results returned).
-    cacheStateForRun = opts.cacheFile ? await loadCache(opts.cacheFile) : null;
+    cacheStateForRun = opts.cacheFile ? await loadCache(opts.cacheFile, log) : null;
 
     for (const base of seeds) {
       if (collected.size >= totalLimit) break;
@@ -716,13 +706,13 @@ export async function discoverCTSubdomains(
       // 1. A fresh cache entry skips the network for this base entirely.
       const cached = refresh ? undefined : cacheStateForRun?.entries.get(base);
       if (cached && Date.now() - cached.fetchedAt < CT_CACHE_TTL_MS) {
-        info(`${base}: using cached results (${formatAge(cached.fetchedAt)})`);
+        log.info(`${base}: using cached results (${formatAge(cached.fetchedAt)})`);
         record("cache", cached.names);
         result.completed++;
         continue;
       }
       if (cached) {
-        info(`${base}: cached results are ${formatAge(cached.fetchedAt)} — fetching fresh ones`);
+        log.info(`${base}: cached results are ${formatAge(cached.fetchedAt)} — fetching fresh ones`);
       }
 
       // 2. The fallback chain: first source that answers wins for this base.
@@ -747,6 +737,7 @@ export async function discoverCTSubdomains(
         const sourceCtx: SourceContext = {
           deadline: Date.now() + shareMs,
           signal: stopCtl.signal,
+          log,
         };
 
         try {
@@ -757,7 +748,7 @@ export async function discoverCTSubdomains(
             // (The DNS runner explains its own empty answers — wildcard zone
             // or "guessing found nothing" — so that isn't repeated here.)
             if (id !== CTSource.DNS) {
-              info(`${base}: ${sourceLabel(id)} found no subdomains${nextLabel ? ` — trying ${nextLabel} instead` : ""}`);
+              log.info(`${base}: ${sourceLabel(id)} found no subdomains${nextLabel ? ` — trying ${nextLabel} instead` : ""}`);
             }
             continue;
           }
@@ -771,7 +762,7 @@ export async function discoverCTSubdomains(
           // while there IS a fallback — a pinned source stays pinned).
           const trips = nextId !== undefined && isProviderDown(err);
           if (trips) downSources.add(id);
-          warn(
+          log.warn(
             `${base}: ${sourceLabel(id)} ${friendlySourceError(err)}` +
               `${nextLabel ? ` — trying ${nextLabel} instead` : " — no other source to try"}` +
               (trips ? " (treated as down for the rest of this run)" : ""),
@@ -779,9 +770,9 @@ export async function discoverCTSubdomains(
         }
       }
 
-      // 3. Nothing worked: a stale cache entry still beats an empty phase 1.5.
+      // 3. Nothing worked: a stale cache entry still beats an empty stage 1.5.
       if (!producedNames && cached && cached.names.length > 0) {
-        warn(
+        log.warn(
           `${base}: all sources failed — using cached results (${formatAge(cached.fetchedAt)}, ${cached.names.length} names)`,
         );
         producedNames = cached.names;
@@ -816,7 +807,7 @@ export async function discoverCTSubdomains(
     result.budgetExpired = budgetFired;
     result.cancelled = stopCtl.signal.aborted && !budgetFired;
     result.names = [...collected].slice(0, totalLimit);
-    if (cacheStateForRun) await saveCache(cacheStateForRun);
+    if (cacheStateForRun) await saveCache(cacheStateForRun, log);
   }
 
   if (result.total > 0) {
@@ -827,22 +818,22 @@ export async function discoverCTSubdomains(
       attempted === result.total ? `all ${result.total}` : `${attempted} of ${result.total}`;
     const kept = result.names.length > 0 ? ` (the ${result.names.length} found are kept)` : "";
     if (result.names.length > 0) {
-      succeeded(
+      log.success(
         `found ${result.names.length} subdomains from ${from} domains` +
           (coverage ? ` — ${coverage}` : ""),
       );
     } else {
-      info(`checked ${from} domains, found no subdomains`);
+      log.info(`checked ${from} domains, found no subdomains`);
     }
     // Only worth saying when something was actually cut short: a limit that
     // fires on the last domain has nothing to complain about.
     const budgetLabel = budgetMs >= 1000 ? `${budgetMs / 1000}s` : `${budgetMs}ms`;
     if (result.budgetExpired && result.skipped > 0) {
-      warn(
+      log.warn(
         `${result.skipped} of ${result.total} domains not checked — the ${budgetLabel} time limit ran out${kept}`,
       );
     } else if (result.cancelled && result.skipped > 0) {
-      info(`stopping early — ${result.skipped} of ${result.total} domains not checked${kept}`);
+      log.info(`stopping early — ${result.skipped} of ${result.total} domains not checked${kept}`);
     }
   }
 

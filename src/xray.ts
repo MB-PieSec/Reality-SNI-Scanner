@@ -12,6 +12,7 @@ import { chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { extractZipEntry } from "./zip.ts";
+import { forPhase } from "./log.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const XRAY_BIN_DIR = path.join(__dirname, "..", "bin");
@@ -109,14 +110,14 @@ async function resolveLatestVersion(): Promise<string> {
     if (!json.tag_name) throw new Error("release feed had no tag_name");
     return json.tag_name;
   } catch (err) {
-    console.error(
-      `[!] xray: latest-release lookup failed (${errorMessage(err)}), using pinned ${FALLBACK_VERSION}`,
-    );
+    const log = forPhase("xray");
+    log.warn(`latest-release lookup failed (${errorMessage(err)}), using pinned ${FALLBACK_VERSION}`);
     return FALLBACK_VERSION;
   }
 }
 
 async function downloadAndInstall(target: PlatformTarget, binPath: string): Promise<void> {
+  const log = forPhase("xray");
   await mkdir(path.dirname(binPath), { recursive: true });
   let lastError: unknown;
 
@@ -124,7 +125,7 @@ async function downloadAndInstall(target: PlatformTarget, binPath: string): Prom
     try {
       const version = await resolveLatestVersion();
       const url = `https://github.com/XTLS/Xray-core/releases/download/${version}/${target.asset}`;
-      console.error(`[*] xray: downloading ${target.asset} (${version}) for ${target.label}...`);
+      log.info(`downloading ${target.asset} (${version}) for ${target.label}...`);
 
       const res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS), redirect: "follow" });
       if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
@@ -142,11 +143,11 @@ async function downloadAndInstall(target: PlatformTarget, binPath: string): Prom
       if (process.platform !== "win32") await chmod(stagingPath, 0o755);
       await rename(stagingPath, binPath);
 
-      console.error(`[+] xray: installed ${binPath} (${version}, ${binary.length} bytes)`);
+      log.success(`installed ${binPath} (${version}, ${binary.length} bytes)`);
       return;
     } catch (err) {
       lastError = err;
-      console.error(`[!] xray: attempt ${attempt}/${DOWNLOAD_ATTEMPTS} failed: ${errorMessage(err)}`);
+      log.warn(`attempt ${attempt}/${DOWNLOAD_ATTEMPTS} failed: ${errorMessage(err)}`);
     }
   }
 

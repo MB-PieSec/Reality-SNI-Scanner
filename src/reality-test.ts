@@ -20,7 +20,7 @@
  *
  * When a candidate fails, the tail of both Xray logs is folded into the error
  * message, because REALITY's own diagnostics say exactly which step of the
- * handshake went wrong. Set REALITY_DEBUG_LOG=1 to additionally dump the full
+ * handshake went wrong. Pass --verbose to additionally dump the full
  * logs of every candidate and turn on REALITY's verbose per-record handshake
  * trace (which record the dest sent and where the handshake aborted).
  */
@@ -33,6 +33,7 @@ import os from "node:os";
 import path from "node:path";
 import { buildClientConfig, buildServerConfig } from "./reality-config.ts";
 import type { RealityTestCandidate, RealityTestOptions, RealityTestResult } from "./types.ts";
+import { forPhase, STAGES } from "./log.ts";
 
 /** Budget for spawning Xray and seeing it accept connections. */
 const STARTUP_TIMEOUT_MS = 8_000;
@@ -80,8 +81,9 @@ function installSignalHandlers(): void {
     }
   };
 
+  const log = forPhase(STAGES[2]);
   process.on("SIGINT", () => {
-    console.error("\n[!] stage 2 interrupted — stopping Xray processes");
+    log.warn("interrupted — stopping Xray processes");
     killAll();
     process.exit(130);
   });
@@ -110,7 +112,7 @@ function stripLogPrefix(line: string): string {
  * A short, human-sized reason from a failed Xray instance: enough to tell a
  * rejected handshake from a startup problem without printing a wall of log
  * that reads like a crash. The complete logs for both sides are one
- * REALITY_DEBUG_LOG away.
+ * --verbose away.
  */
 function logSnippet(instance: XrayInstance | undefined): string {
   if (!instance) return "";
@@ -341,7 +343,8 @@ async function pushPayload(
 ): Promise<number> {
   const startedAt = performance.now();
   let socket: net.Socket | undefined;
-  if (process.env.REALITY_DEBUG_LOG) console.error(`[debug] ${phase}: connect 127.0.0.1:${port}`);
+  const log = forPhase(STAGES[2]);
+  log.debug(`${phase}: connect 127.0.0.1:${port}`);
   try {
     socket = await connectTo(port, timeoutMs);
     // Later errors just leave the byte count short; the waiter reports them.
@@ -361,15 +364,14 @@ async function runAttempt(
   opts: RealityTestOptions,
   payload: Buffer,
 ): Promise<RealityTestResult> {
+  const log = forPhase(STAGES[2]);
   const { hostname, handshakeMs } = candidate;
   // The sink is bound first on purpose: reserveFreePorts hands its ports back
   // as soon as its probes close, and a sink created after that could be given
   // one of the ports Xray is about to use.
   const sink = await createSink();
   const [serverPort, clientPort] = await reserveFreePorts(2);
-  if (process.env.REALITY_DEBUG_LOG) {
-    console.error(`[debug] ${hostname}: server=${serverPort} client=${clientPort} sink=${sink.port}`);
-  }
+  log.debug(`${hostname}: server=${serverPort} client=${clientPort} sink=${sink.port}`);
   let server: XrayInstance | undefined;
   let client: XrayInstance | undefined;
   let workDir: string | undefined;
@@ -432,9 +434,7 @@ async function runAttempt(
     else if (clientReason) parts.push(`client: ${clientReason}`);
     return { hostname, ok: false, handshakeMs, error: parts.join(" | ") };
   } finally {
-    if (process.env.REALITY_DEBUG_LOG) {
-      console.error(`\n--- server log [${hostname}] ---\n${server?.logs()}\n--- client log [${hostname}] ---\n${client?.logs()}`);
-    }
+    log.debug(`\n--- server log [${hostname}] ---\n${server?.logs()}\n--- client log [${hostname}] ---\n${client?.logs()}`);
     stopChild(client?.child);
     stopChild(server?.child);
     await sink.close();
