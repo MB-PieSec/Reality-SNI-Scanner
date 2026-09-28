@@ -4,16 +4,14 @@
  * they all apply the same bar consistently.
  */
 
-// Domains that show up in various discovery sources but are poor Reality
-// camouflage picks: known-blocked-in-Iran, adult/gambling-adjacent, or
-// otherwise likely to draw more DPI attention than they deflect.
-const DENYLIST_SUBSTRINGS = [
-  "porn",
-  "xxx",
-  "bet",
-  "casino",
-  "gambl",
-  "torrent",
+// Known-blocked-in-Iran, adult/gambling-adjacent, or otherwise likely to draw
+// more DPI attention than they deflect.
+// ponytail: substrings only for words that are never part of a real brand;
+// short ones (x.com, bet) are matched on label boundaries so netflix.com,
+// dropbox.com and alphabet.com survive.
+const DENY_SUBSTRINGS = ["porn", "xxx", "casino", "gambl", "torrent"];
+const DENY_BET = /(^|[.-])(\d*x)?bet(\d|[.-]|$)/;
+const DENY_HOSTS = [
   "facebook.com",
   "twitter.com",
   "x.com",
@@ -28,7 +26,9 @@ export function isAcceptableDomain(domain: string): boolean {
   const lower = domain.trim().toLowerCase().replace(/\.$/, "");
   if (lower.length > 253) return false;
   if (!HOSTNAME_RE.test(lower)) return false;
-  return !DENYLIST_SUBSTRINGS.some((bad) => lower.includes(bad));
+  if (DENY_SUBSTRINGS.some((bad) => lower.includes(bad))) return false;
+  if (DENY_BET.test(lower)) return false;
+  return !DENY_HOSTS.some((h) => lower === h || lower.endsWith(`.${h}`));
 }
 
 /** Normalizes a hostname and rejects it unless it passes the shared policy. */

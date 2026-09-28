@@ -493,14 +493,10 @@ export async function runRealityTests(
   return results;
 }
 
-/** Ranks Stage-2 results: fastest measured upload first, then Stage-1 latency. */
+/** Ranks Stage-2 results: tunnels that worked first, then Stage-1 latency. kbps is informational only: the sink is loopback, so it mostly reflects the dest round trip. */
 export function rankRealityResults(results: RealityTestResult[]): RealityTestResult[] {
   return [...results].sort((a, b) => {
     if (a.ok !== b.ok) return a.ok ? -1 : 1;
-    if (a.ok && b.ok) {
-      const delta = (b.realityUploadKbps ?? 0) - (a.realityUploadKbps ?? 0);
-      if (delta !== 0) return delta;
-    }
     return (a.handshakeMs ?? Infinity) - (b.handshakeMs ?? Infinity);
   });
 }

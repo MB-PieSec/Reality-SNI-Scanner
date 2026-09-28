@@ -27,10 +27,10 @@ function parseArgs(argv: string[]) {
   const flags = new Map<string, string>();
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
+    if (arg.startsWith("-") && arg.length > 1) {
+      const key = arg.replace(/^-+/, "");
       const next = argv[i + 1];
-      if (next && !next.startsWith("--")) {
+      if (next && !next.startsWith("-")) {
         flags.set(key, next);
         i++;
       } else {
@@ -86,7 +86,7 @@ Options:
   --require-authorized  Require a fully valid/trusted cert chain (default: off — Reality doesn't need CA trust, just a plausible cert)
   --reality-test <n>    Stage 2: re-test the top N candidates by pushing a
                          real upload through a temporary Xray Reality tunnel, then
-                         rank those N by measured upload speed
+                         rank those N by Stage 1 handshake time (kbps is informational)
                          (default: min(10, --top); 0 = off)
   --reality-upload-kb <n>  Stage 2 upload payload size in KB (default 512)
   --reality-concurrency <n>  Stage 2 tests to run in parallel, 1-4 (default 2 —
@@ -175,8 +175,8 @@ function rankProbeResults(results: ProbeResult[]): ProbeResult[] {
     if (latencyA !== latencyB) return latencyA - latencyB;
 
     // Tie-breaker 1: TLS version (TLSv1.3 > TLSv1.2)
-    const tlsA = (a.tlsVersion?.indexOf("1.3") ?? 0) >= 0 ? 1 : (a.tlsVersion?.indexOf("1.2") ?? 0) >= 0 ? 2 : 3;
-    const tlsB = (b.tlsVersion?.indexOf("1.3") ?? 0) >= 0 ? 1 : (b.tlsVersion?.indexOf("1.2") ?? 0) >= 0 ? 2 : 3;
+    const tlsA = a.tlsVersion === "TLSv1.3" ? 1 : 2;
+    const tlsB = b.tlsVersion === "TLSv1.3" ? 1 : 2;
     if (tlsA !== tlsB) return tlsA - tlsB;
 
     // Tie-breaker 2: Certificate authorization
@@ -190,7 +190,6 @@ function rankProbeResults(results: ProbeResult[]): ProbeResult[] {
       "asn-neighbor": 2,
       "ct-subdomain": 3,
       "ct-log": 4,
-      "fallback": 5,
     };
     return sourceOrder[a.source] - sourceOrder[b.source];
   });

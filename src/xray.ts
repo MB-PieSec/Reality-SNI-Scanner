@@ -8,6 +8,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmod, mkdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -130,6 +131,17 @@ async function downloadAndInstall(target: PlatformTarget, binPath: string): Prom
       const res = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS), redirect: "follow" });
       if (!res.ok) throw new Error(`download failed: HTTP ${res.status} for ${url}`);
       const archive = Buffer.from(await res.arrayBuffer());
+
+      // Verify against the release's own .dgst file before touching disk.
+      // Same host as the archive, so this catches corruption/truncation, not a
+      // compromised release.
+      const dgst = await fetch(`${url}.dgst`, { signal: AbortSignal.timeout(API_TIMEOUT_MS), redirect: "follow" });
+      if (!dgst.ok) throw new Error(`checksum file: HTTP ${dgst.status}`);
+      const expected = /SHA(?:2-)?256\s*=\s*([0-9a-f]{64})/i.exec(await dgst.text())?.[1]?.toLowerCase();
+      if (!expected) throw new Error("checksum file has no SHA-256 line");
+      if (createHash("sha256").update(archive).digest("hex") !== expected) {
+        throw new Error("SHA-256 mismatch, refusing to install");
+      }
 
       const binary = extractZipEntry(archive, target.binaryName);
       if (binary.length < MIN_BINARY_BYTES) {

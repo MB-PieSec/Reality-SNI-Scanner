@@ -7,7 +7,7 @@ export interface ProbeResult {
   authorized?: boolean;
   issuer?: string;
   error?: string;
-  source: "top-sites" | "asn-neighbor" | "ct-log" | "fallback" | "ct-subdomain";
+  source: "top-sites" | "asn-neighbor" | "ct-log" | "ct-subdomain";
 }
 
 export interface ScanOptions {
@@ -19,8 +19,6 @@ export interface ScanOptions {
   requireTls13: boolean;
   requireAuthorized: boolean;
 }
-
-export type CTDiscoveryMode = "seeds" | "main-domains";
 
 /** A Stage-1 winner handed to Stage 2. */
 export interface RealityTestCandidate {

@@ -86,6 +86,7 @@ async function probeOne(
   hostname: string,
   port: number,
   timeoutMs: number,
+  requireTls13: boolean,
 ): Promise<Omit<ProbeResult, "source" | "hostname">> {
   const start = performance.now();
   const remaining = () => timeoutMs - (performance.now() - start);
@@ -106,7 +107,7 @@ async function probeOne(
         port,
         servername: hostname,
         ALPNProtocols: ["h2", "http/1.1"],
-        minVersion: "TLSv1.3",
+        minVersion: requireTls13 ? "TLSv1.3" : "TLSv1.2",
         timeout: budget,
         // We want to see the real cert outcome ourselves, not have the
         // connection throw on a self-signed/mismatched cert.
@@ -176,7 +177,7 @@ export async function probeAll(
 ): Promise<ProbeResult[]> {
   let done = 0;
   const results = await runPool(candidates, opts.concurrency, async (c) => {
-    const r = await probeOne(c.hostname, opts.port, opts.timeoutMs);
+    const r = await probeOne(c.hostname, opts.port, opts.timeoutMs, opts.requireTls13);
     done++;
     onProgress?.(done, candidates.length);
     return { hostname: c.hostname, source: c.source, ...r };

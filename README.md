@@ -143,10 +143,10 @@ this machine --TCP--> [Xray client] ==REALITY==> [Xray server] --TCP--> this mac
 ```
 
 Everything is killed again as soon as the measurement is done. A domain that
-carried the upload is proven to work as a `dest`, and the measured speed is
-what decides the final pick, so the suggestion at the end of the run comes from
-the fastest domain that actually completed a tunnel — not from the fastest
-TLS handshake. Domains that fail the tunnel are still listed, with the reason.
+carried the upload is proven to work as a `dest`, and the final pick is the
+fastest-handshake domain that completed a tunnel. The upload lands in a local
+sink, so the kbps figure mostly reflects the dest round trip and is
+informational. Domains that fail the tunnel are still listed, with the reason.
 
 This stage costs real time — roughly 5–15 s per candidate, since Xray probes
 the dest while it starts — which is why it only runs on the top candidates.
@@ -156,11 +156,12 @@ skips it and leaves you with the Stage 1 table only.
 
 **You do not need to install Xray yourself.** The first time a run uses
 Stage 2, the tool downloads the official Xray-core build for your operating
-system into a `bin` folder next to `run.js` (about 20 MB, once) and reuses it
-afterwards. If that download fails — GitHub blocked, say — the Stage 1 results
-are already saved, and the tool says what happened and carries on rather than
-losing the run. If you already have Xray on the machine, `--xray <path>` uses
-that copy instead of downloading one.
+system into a `bin` folder next to `run.js` (about 20 MB, once), checks it
+against the SHA-256 published with the release, and reuses it afterwards. If
+that download fails — GitHub blocked, say — the Stage 1 results are already
+saved, and the tool says what happened and carries on rather than losing the
+run. If you already have Xray on the machine, `--xray <path>` uses that copy
+instead of downloading one.
 
 ## The three ways it finds domains
 
@@ -291,35 +292,6 @@ Reality tunnel test (Stage 2):
 - `--xray <path>`: use an Xray binary you already have instead of the
   automatically downloaded one.
 
-<!-- Legacy table retained in source; the compact list above is used because the table is unreadable on narrow GitHub layouts.
-| Flag | Default | What it does |
-|---|---|---|
-| `--candidates <n>` | 400 | how many domains to try from the built-in list |
-| `--neighbors` | off | also look for domains near your own server (see method 2 above) |
-| `--target <ip>` | — | your server's IP (used to look up its network block automatically) |
-| `--prefix <cidr>` | — | give the network block directly, skipping the automatic lookup |
-| `--sample <n>` | 200 | how many IPs to check in that block |
-| `--ct` | off | also search Certificate Transparency logs (see method 3 above) |
-| `--ct-seeds <list>` | microsoft.com,google.com,apple.com,cloudflare.com,amazon.com,akamai.com,fastly.net,wikipedia.org,github.com,mozilla.org | comma-separated companies to search |
-| `--ct-limit <n>` | 300 | max results to pull from those logs (each response is also capped at 5 MiB) |
-| `--remote` | off | download a fresh domain list instead of using the built-in one (needs internet reachable without a VPN — see "Why it's built this way" above) |
-| `--concurrency <n>` | 40 | how many domains to test at the same time |
-| `--timeout <ms>` | 4000 | how long to wait for each domain before giving up |
-| `--asn-timeout <ms>` | 20000 | how long to wait for the automatic network-block lookup (raise this if your connection is slow) |
-| `--ct-timeout <ms>` | 10000 | total wall-clock budget for one CT discovery phase (shared by every source, retry and fallback) |
-| `--ct-source <name>` | auto | which CT source discovery may use: auto (crt.sh → Cert Spotter → DNS guessing), crtsh, certspotter, dns |
-| `--ct-refresh` | off | ignore the ct-cache.json disk cache and refetch everything |
-| `--no-ct` | off | skip Stage 1.5 subdomain discovery entirely |
-| `--port <n>` | 443 | which port to test (443 is the standard HTTPS port — leave this alone unless you know why you'd change it) |
-| `--top <n>` | 15 | how many results to show |
-| `--out <file>` | results.json | where to save the full results, including failed ones |
-| `--no-require-h2` | — | don't require HTTP/2 support |
-| `--no-require-tls13` | — | don't require TLS 1.3 |
-| `--require-authorized` | off | require a certificate trusted by a public authority (Reality doesn't actually need this) |
-| `--help` | — | show all options |
-
--->
-
 ## Reading the results
 
 Each row shows: the domain, which method found it, the TLS version it
@@ -389,4 +361,5 @@ too old for this feature to exist at all, running `node run.js` will tell
 you clearly instead of just crashing.
 
 (If you also want the optional type-checking tools for editing this code —
-not needed just to run it — run `npm install` once, then `npm run typecheck`.)
+not needed just to run it — run `npm install` once, then `npm run typecheck`.
+`node src/filters.check.ts` runs a small self-check of the domain denylist.)
